@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import CanonTetherCore
 
 /// The single on-disk location captures are downloaded to, shared by the session (which writes
@@ -232,7 +233,7 @@ actor GPhotoSession {
         return linkLocalFallback
     }
 
-    private func runOneShot(_ executablePath: String, _ arguments: [String]) throws -> String {
+    private func runOneShot(_ executablePath: String, _ arguments: [String], timeout: TimeInterval = 5) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
         process.arguments = arguments
@@ -249,17 +250,27 @@ actor GPhotoSession {
         let errHandle = stderr.fileHandleForReading
         let results = NSMutableArray(array: [Data(), Data()])
         let readGroup = DispatchGroup()
+        // .userInitiated, not .utility: this backs networkCameraIP()'s ARP lookup, called on every
+        // reconnect retry — a .utility thread can sit unscheduled under load well past what these
+        // short-lived reads should take (see isReachable's matching note on the same theory).
         readGroup.enter()
-        DispatchQueue.global(qos: .utility).async {
+        DispatchQueue.global(qos: .userInitiated).async {
             results[0] = outHandle.readDataToEndOfFile()
             readGroup.leave()
         }
         readGroup.enter()
-        DispatchQueue.global(qos: .utility).async {
+        DispatchQueue.global(qos: .userInitiated).async {
             results[1] = errHandle.readDataToEndOfFile()
             readGroup.leave()
         }
+        // `gphoto2 --auto-detect` occasionally stalls scanning the USB bus (seen stalling this
+        // synchronous call, and with it the whole ARP-based reconnect loop that calls it inline,
+        // for 30-80s+) — kill the child past `timeout` so a slow probe can't starve reconnect
+        // polling that's supposed to run about once a second.
+        let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
         process.waitUntilExit()
+        watchdog.cancel()
         readGroup.wait()
         let outData = results[0] as! Data
         let errData = results[1] as! Data
@@ -424,6 +435,61 @@ actor GPhotoSession {
         _ = try? await sendCommand("summary", doneMarkers: ["Manufacturer:", "ERROR", "*** Error"], timeout: 15)
     }
 
+    /// Standard PTP/IP port, per gphoto2's `ptpip:` driver default.
+    private static let ptpipPort: UInt16 = 15740
+
+    /// A cheap TCP reachability probe against the PTP/IP port, used before committing to a full
+    /// `gphoto2 --shell` handshake. An ARP entry can outlive the camera's actual pairing under that
+    /// address (it re-paired under a new self-assigned IP, but the old entry hasn't aged out yet) —
+    /// connecting to a dead address doesn't fail fast, it just hangs until openShell's own ~100s
+    /// readyTimeout gives up. A live TCP handshake here in a couple seconds is a strong signal the
+    /// full attempt is worth making; failing it means don't bother waiting the full 100s to find out.
+    ///
+    /// Raw BSD socket + `poll()` rather than Network.framework: a non-blocking `connect()` returns
+    /// immediately with `EINPROGRESS` regardless of whether the kernel's own ARP resolution for a
+    /// dead destination has finished, so `poll()`'s timeout is a hard, OS-level deadline — unlike
+    /// `NWConnection`, whose higher-level state machine was observed (against a genuinely stale
+    /// link-local address) taking 15-25s to report failure despite an identical 2s target, seemingly
+    /// queued behind in-flight kernel ARP retries that cancelling the connection object didn't abort.
+    /// Closing the raw socket on any exit path does cleanly abandon the attempt at the kernel level.
+    private func isReachable(_ ip: String, timeout: TimeInterval = 2) async -> Bool {
+        let port = Self.ptpipPort
+        // .userInitiated, not .utility: this gates user-visible reconnect speed, and a .utility
+        // thread can sit unscheduled under system load well past poll()'s own 2s deadline once it
+        // finally runs — observed live as intermittent ~12s stalls on top of an otherwise ~2s cadence.
+        return await Task.detached(priority: .userInitiated) {
+            let sock = socket(AF_INET, SOCK_STREAM, 0)
+            guard sock >= 0 else { return false }
+            defer { close(sock) }
+
+            let flags = fcntl(sock, F_GETFL, 0)
+            _ = fcntl(sock, F_SETFL, flags | O_NONBLOCK)
+
+            var addr = sockaddr_in()
+            addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = in_port_t(port).bigEndian
+            guard inet_pton(AF_INET, ip, &addr.sin_addr) == 1 else { return false }
+
+            let connectResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    Darwin.connect(sock, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            if connectResult == 0 { return true } // connected immediately
+            guard errno == EINPROGRESS else { return false }
+
+            var pfd = pollfd(fd: sock, events: Int16(POLLOUT), revents: 0)
+            let pollResult = poll(&pfd, 1, Int32(timeout * 1000))
+            guard pollResult > 0, Int32(pfd.revents) & Int32(POLLOUT) != 0 else { return false }
+
+            var soError: Int32 = 0
+            var len = socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(sock, SOL_SOCKET, SO_ERROR, &soError, &len) == 0 else { return false }
+            return soError == 0
+        }.value
+    }
+
     /// Ensures a live, camera-confirmed shell session exists, waiting indefinitely for the
     /// camera to appear on the network/USB while the user works through its pairing menu.
     private func ensureConnected() async throws {
@@ -444,18 +510,37 @@ actor GPhotoSession {
         while true {
             // Network is the primary path here, and `networkCameraIP()` (an ARP lookup) is fast, so
             // check it every second — a camera that reappears after a reset is grabbed promptly.
-            if let ip = networkCameraIP() {
+            if var ip = networkCameraIP() {
                 log("found camera at \(ip), connecting...")
                 status("Connecting to camera…")
                 for attempt in 1...Self.connectRetryAttempts {
+                    guard await isReachable(ip) else {
+                        // A dead/stale address: don't sink the full ~100s readyTimeout into a
+                        // gphoto2 handshake attempt that will never get an answer. Re-resolve ARP
+                        // and try again promptly instead.
+                        log("ptpip:\(ip) not answering — re-checking for a fresher address")
+                        guard let freshIP = networkCameraIP() else { break }
+                        ip = freshIP
+                        try? await Task.sleep(nanoseconds: Self.connectRetryDelay)
+                        continue
+                    }
                     log("attempt \(attempt)/\(Self.connectRetryAttempts): connecting to ptpip:\(ip)")
                     if await openShell(port: "ptpip:\(ip)") {
                         markConnected(true)
                         status("Connected")
                         return
                     }
-                    // The camera may have dropped off mid-retry; fall back to waiting for it.
-                    if networkCameraIP() == nil { break }
+                    // A failed attempt against a link-local address that's since gone stale (the
+                    // camera re-paired under a new self-assigned IP mid-attempt) doesn't error out —
+                    // it just hangs until openShell's own ~100s readyTimeout gives up. Re-resolve ARP
+                    // before the next attempt so a fresh IP is picked up immediately instead of
+                    // burning that same ~100s timeout again against an address that will never answer.
+                    guard let freshIP = networkCameraIP() else { break }
+                    if freshIP != ip {
+                        log("camera moved to \(freshIP) mid-retry — reconnecting there instead")
+                        ip = freshIP
+                        continue
+                    }
                     try? await Task.sleep(nanoseconds: Self.connectRetryDelay)
                 }
             } else {
