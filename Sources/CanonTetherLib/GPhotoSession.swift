@@ -71,6 +71,17 @@ actor GPhotoSession {
     private static let keepAliveCheckInterval: UInt64 = 5_000_000_000
     private static let keepAliveThreshold: TimeInterval = 25
 
+    // Distinct from SleepPreventer's user-facing toggle (which keeps the whole Mac awake): this
+    // exempts just this process's own timers from App Nap for the app's lifetime, regardless of
+    // whether the user wants their Mac to sleep. Without it, live testing showed the reconnect
+    // loop's ~1s `Task.sleep` polling occasionally stretching to 10s+ once the app lost focus —
+    // invisible to CPU profiling (a throttled sleep still looks like correctly-idle, just delayed),
+    // and exactly the case a tethered camera app can't afford: reconnecting while unfocused.
+    private let appNapAssertion: NSObjectProtocol = ProcessInfo.processInfo.beginActivity(
+        options: .userInitiated,
+        reason: "Maintaining tethered camera connection"
+    )
+
     private var process: Process?
     private var stdinHandle: FileHandle?
     private let buffer = OutputBuffer()

@@ -699,6 +699,7 @@ private struct MetaBar: View {
 /// one action that brings it back — re-entering pairing mode — while the app auto-reconnects.
 private struct ReconnectBanner: View {
     let status: String
+    @State private var showingNetworkSetup = false
 
     // `status` already carries the live wait/connect wording ("Waiting for camera…",
     // "Connecting to camera…"); using it as the title (instead of a fixed "Waiting for camera")
@@ -719,6 +720,12 @@ private struct ReconnectBanner: View {
                     .lineLimit(2)
             }
             Spacer()
+            // A camera set to require DHCP over a direct Mac-to-camera cable (no DHCP server on that
+            // link) waits indefinitely for an address it will never get. Manual settings skip that
+            // negotiation entirely — this surfaces the exact values to type in, computed from the
+            // Mac's own self-assigned address on the same cable.
+            Button("Manual Setup…") { showingNetworkSetup = true }
+                .controlSize(.small)
             Image(systemName: "cable.connector.slash")
                 .foregroundStyle(.orange)
         }
@@ -726,6 +733,9 @@ private struct ReconnectBanner: View {
         .padding(.vertical, 10)
         .background(Color.orange.opacity(0.12))
         .overlay(alignment: .bottom) { Divider() }
+        .sheet(isPresented: $showingNetworkSetup) {
+            CameraNetworkSetupView()
+        }
     }
 }
 
