@@ -89,6 +89,33 @@ final class ShotAnalysisStore: ObservableObject {
     /// recompute), publishing and persisting the results. Cached readings in the file's xattrs
     /// short-circuit the pixel work; the photo is sampled only if some enabled check still needs it.
     func analyze(_ url: URL, force: Bool = false) {
+        Task { await performAnalysis(url, force: force) }
+    }
+
+    /// Same checks as `analyze`, but for a whole folder at once (e.g. opening a project or toggling
+    /// "Show Good Shots Only"): runs with a small bounded concurrency instead of firing one
+    /// unstructured `Task` per photo. An uncapped fan-out over a big session — real sessions here run
+    /// into the thousands of files (see the calibration notes above) — starts that many simultaneous
+    /// ImageIO decodes at once, which thrashes disk/CPU and floods the main actor with per-photo
+    /// published updates; capping keeps decode work steady instead of bursty.
+    private static let maxConcurrentAnalyses = 4
+
+    func analyzeAll(_ urls: [URL], force: Bool = false) async {
+        await withTaskGroup(of: Void.self) { group in
+            var iterator = urls.makeIterator()
+            for _ in 0..<Self.maxConcurrentAnalyses {
+                guard let url = iterator.next() else { break }
+                group.addTask { await self.performAnalysis(url, force: force) }
+            }
+            while await group.next() != nil {
+                if let url = iterator.next() {
+                    group.addTask { await self.performAnalysis(url, force: force) }
+                }
+            }
+        }
+    }
+
+    private func performAnalysis(_ url: URL, force: Bool) async {
         let wantFocus = Self.focusEnabled && (force || focus[url] == nil)
         let wantExposure = Self.exposureEnabled && (force || exposure[url] == nil)
         guard wantFocus || wantExposure else { return }
@@ -97,39 +124,37 @@ final class ShotAnalysisStore: ObservableObject {
         let highlightLimit = Self.exposureHighlightClipLimit, shadowLimit = Self.exposureShadowClipLimit
         let nearWhiteLimit = Self.exposureNearWhiteLimit
 
-        Task {
-            // Serve from cache where we can, and only decode if something still needs pixels.
-            var needFocus = wantFocus, needExposure = wantExposure
-            if needFocus, !force, let cached = Self.readFocusScore(url) {
-                focus[url] = FocusResult(cachedScore: cached, sharpThreshold: focusSharp, softThreshold: focusSoft)
-                needFocus = false
-            }
-            if needExposure, !force, let cached = Self.readExposure(url) {
-                exposure[url] = ExposureResult(cachedHighlightClip: cached.0, shadowClip: cached.1,
-                                               nearWhite: cached.2, median: cached.3,
-                                               highlightClipLimit: highlightLimit,
-                                               shadowClipLimit: shadowLimit, nearWhiteLimit: nearWhiteLimit)
-                needExposure = false
-            }
-            guard needFocus || needExposure else { return }
-
-            guard let frame = await ScopeSampler.sample(url, maxPixel: Self.sampleSize) else { return }
-
-            var focusResult: FocusResult?
-            var exposureResult: ExposureResult?
-            if needFocus {
-                let r = FocusAnalyzer.evaluate(frame, sharpThreshold: focusSharp, softThreshold: focusSoft)
-                focus[url] = r
-                focusResult = r
-            }
-            if needExposure {
-                let r = ExposureAnalyzer.evaluate(frame, highlightClipLimit: highlightLimit,
-                                                   shadowClipLimit: shadowLimit, nearWhiteLimit: nearWhiteLimit)
-                exposure[url] = r
-                exposureResult = r
-            }
-            await Self.persist(focus: focusResult, exposure: exposureResult, to: url)
+        // Serve from cache where we can, and only decode if something still needs pixels.
+        var needFocus = wantFocus, needExposure = wantExposure
+        if needFocus, !force, let cached = Self.readFocusScore(url) {
+            focus[url] = FocusResult(cachedScore: cached, sharpThreshold: focusSharp, softThreshold: focusSoft)
+            needFocus = false
         }
+        if needExposure, !force, let cached = Self.readExposure(url) {
+            exposure[url] = ExposureResult(cachedHighlightClip: cached.0, shadowClip: cached.1,
+                                           nearWhite: cached.2, median: cached.3,
+                                           highlightClipLimit: highlightLimit,
+                                           shadowClipLimit: shadowLimit, nearWhiteLimit: nearWhiteLimit)
+            needExposure = false
+        }
+        guard needFocus || needExposure else { return }
+
+        guard let frame = await ScopeSampler.sample(url, maxPixel: Self.sampleSize) else { return }
+
+        var focusResult: FocusResult?
+        var exposureResult: ExposureResult?
+        if needFocus {
+            let r = FocusAnalyzer.evaluate(frame, sharpThreshold: focusSharp, softThreshold: focusSoft)
+            focus[url] = r
+            focusResult = r
+        }
+        if needExposure {
+            let r = ExposureAnalyzer.evaluate(frame, highlightClipLimit: highlightLimit,
+                                               shadowClipLimit: shadowLimit, nearWhiteLimit: nearWhiteLimit)
+            exposure[url] = r
+            exposureResult = r
+        }
+        await Self.persist(focus: focusResult, exposure: exposureResult, to: url)
     }
 
     /// Drops every remembered result for a project (capture-folder) switch, mirroring

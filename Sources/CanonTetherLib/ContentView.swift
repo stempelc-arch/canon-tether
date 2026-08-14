@@ -97,7 +97,7 @@ public struct ContentView: View {
             Button {
                 showingOnlyGood.toggle()
                 if showingOnlyGood {
-                    for url in viewModel.captures { analysis.analyze(url) }
+                    Task { await analysis.analyzeAll(viewModel.captures) }
                 }
             } label: {
                 Label("Show Good Shots Only", systemImage: showingOnlyGood ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
