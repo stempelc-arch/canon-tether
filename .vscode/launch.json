@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Canon Tethering App}",
+            "name": "Debug CanonTether",
+            "target": "CanonTether",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug CanonTether"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Canon Tethering App}",
+            "name": "Release CanonTether",
+            "target": "CanonTether",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release CanonTether"
+        }
+    ]
+}

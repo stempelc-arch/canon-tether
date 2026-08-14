@@ -1,0 +1,19 @@
+.DS_Store
+.build/
+.swiftpm/
+*.xcodeproj
+xcuserdata/
+
+# Built app bundle + generated icon intermediates (produced by scripts/build-app.sh)
+CanonTether.app/
+scripts/icon-1024.png
+scripts/AppIcon.iconset/
+captures/
+
+# Local test shoots and vendored library source — not part of the app source
+Aug 13 Tests/
+libgphoto2-src/
+
+# DMG build output
+*.dmg
+dist/
