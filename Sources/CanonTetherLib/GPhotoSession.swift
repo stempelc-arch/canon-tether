@@ -139,18 +139,27 @@ actor GPhotoSession {
     private var commandWaiters: [CheckedContinuation<Void, Never>] = []
     private var isEstablishing = false
 
+    /// Fair FIFO acquisition. The `!commandWaiters.isEmpty` half matters as much as the busy flag:
+    /// without it, a caller that re-acquires immediately after releasing — which is exactly what
+    /// the live view loop does — barges ahead of an already-woken waiter every time, and starves
+    /// it indefinitely. That made the shutter unusable while live view was running: the capture
+    /// queued and never got a turn.
     private func acquireCommandLock() async {
-        while commandBusy {
+        if commandBusy || !commandWaiters.isEmpty {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 commandWaiters.append(continuation)
             }
+            // Resumed by `releaseCommandLock`, which hands ownership over directly rather than
+            // dropping the lock — so there's deliberately no re-check of `commandBusy` here.
         }
         commandBusy = true
     }
 
     private func releaseCommandLock() {
-        commandBusy = false
-        if !commandWaiters.isEmpty {
+        if commandWaiters.isEmpty {
+            commandBusy = false
+        } else {
+            // Direct handoff: stay busy so a barging caller can't slip in ahead of the queue.
             commandWaiters.removeFirst().resume()
         }
     }
@@ -520,6 +529,9 @@ actor GPhotoSession {
 
     private var connectFailureLogCount = 0
     private static let verboseConnectFailures = 5
+    /// Any command waiting longer than this for the shell is worth recording — it means something
+    /// else is monopolising the camera.
+    private static let slowLockWarning: TimeInterval = 1
 
     private static let captureTargetPath = "/main/settings/capturetarget"
     // Names vary by body/firmware; match loosely rather than pin one exact string.
@@ -775,8 +787,16 @@ actor GPhotoSession {
     /// suppresses the verbose send/recv logging for the high-frequency tether poll so it doesn't
     /// flood the log file.
     private func sendCommand(_ command: String, doneMarkers: [String], timeout: TimeInterval, quiet: Bool = false) async throws -> String {
+        // Timed, because the lock is acquired *before* anything is logged: a command starved here
+        // leaves no trace at all, which is precisely how a shutter press blocked behind the live
+        // view loop looked like "the app ignored me" with an empty log.
+        let lockWaitStart = Date()
         await acquireCommandLock()
         defer { releaseCommandLock() }
+        let lockWait = Date().timeIntervalSince(lockWaitStart)
+        if lockWait > Self.slowLockWarning {
+            log("command lock: \(command) waited \(String(format: "%.1f", lockWait))s")
+        }
         guard let stdinHandle, let process, process.isRunning else {
             throw GPhotoError.noCameraDetected
         }
@@ -940,8 +960,14 @@ actor GPhotoSession {
 
     /// JPEG frames from the camera's live view, as fast as the link round-trips them. Empty while
     /// live view is off.
+    ///
+    /// `bufferingNewest(1)` is essential, not a tuning detail: with the default unbounded buffer,
+    /// frames arriving faster than the UI can decode them queue up forever and the picture falls
+    /// progressively further behind reality — the feed stays smooth while becoming unusably
+    /// laggy, which is exactly what was observed at ~18 fps. For a live feed a stale frame has no
+    /// value at all; only the newest one does, so older frames are dropped rather than shown late.
     nonisolated func liveViewStream() -> AsyncStream<Data> {
-        AsyncStream { continuation in
+        AsyncStream(Data.self, bufferingPolicy: .bufferingNewest(1)) { continuation in
             Task { await self.setLiveViewContinuation(continuation) }
         }
     }

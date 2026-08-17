@@ -68,7 +68,19 @@ final class CameraViewModel: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             for await data in self.session.liveViewStream() {
-                let image = await Task.detached { NSImage(data: data) }.value
+                // `NSImage(data:)` only *wraps* the bytes — the actual JPEG decode is deferred to
+                // draw time, i.e. onto the main thread, every frame. At streaming rates that
+                // buries the main thread in decode work and the feed lags badly. Decoding through
+                // ImageIO with `shouldCacheImmediately` forces the work to happen here, off the
+                // main actor, so the main thread only ever blits an already-decoded bitmap.
+                let image = await Task.detached(priority: .userInitiated) { () -> NSImage? in
+                    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                          let cg = CGImageSourceCreateImageAtIndex(source, 0, [
+                              kCGImageSourceShouldCacheImmediately: true
+                          ] as CFDictionary)
+                    else { return nil }
+                    return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+                }.value
                 guard self.isLiveViewOn else { continue }
                 self.liveViewImage = image
             }
@@ -279,7 +291,12 @@ final class CameraViewModel: ObservableObject {
     }
 
     private func run(_ work: @escaping () async throws -> Void) {
-        guard !isBusy else { return }
+        // A dropped action used to vanish without a trace, so a shutter press that arrived while
+        // something else was in flight simply did nothing and said nothing. Surface it.
+        guard !isBusy else {
+            statusText = "Camera is busy — try again in a moment"
+            return
+        }
         isBusy = true
         errorMessage = nil
         Task {
