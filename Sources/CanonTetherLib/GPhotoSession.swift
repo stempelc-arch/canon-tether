@@ -828,17 +828,35 @@ actor GPhotoSession {
     /// Sends a command to the already-open shell session and waits for it to finish. `quiet`
     /// suppresses the verbose send/recv logging for the high-frequency tether poll so it doesn't
     /// flood the log file.
+    /// Runs a batch of commands under a single lock acquisition.
+    ///
+    /// Reading the camera's settings is five separate `get-config`s, and one-lock-per-command made
+    /// each of them queue behind a full tether listening window — so a settings read cost about
+    /// five seconds and the inspector lagged the camera's own dials by six. Taking the lock once
+    /// for the batch turns that into one wait plus five fast commands, and holds the camera for a
+    /// single contiguous window instead of interleaving with the tether watch five times.
+    private func withCommandLock<T>(_ body: () async throws -> T) async rethrows -> T {
+        await acquireCommandLock()
+        defer { releaseCommandLock() }
+        return try await body()
+    }
+
     private func sendCommand(_ command: String, doneMarkers: [String], timeout: TimeInterval, quiet: Bool = false) async throws -> String {
         // Timed, because the lock is acquired *before* anything is logged: a command starved here
         // leaves no trace at all, which is precisely how a shutter press blocked behind the live
         // view loop looked like "the app ignored me" with an empty log.
         let lockWaitStart = Date()
-        await acquireCommandLock()
-        defer { releaseCommandLock() }
-        let lockWait = Date().timeIntervalSince(lockWaitStart)
-        if lockWait > Self.slowLockWarning {
-            log("command lock: \(command) waited \(String(format: "%.1f", lockWait))s")
+        return try await withCommandLock {
+            let lockWait = Date().timeIntervalSince(lockWaitStart)
+            if lockWait > Self.slowLockWarning {
+                log("command lock: \(command) waited \(String(format: "%.1f", lockWait))s")
+            }
+            return try await sendCommandLocked(command, doneMarkers: doneMarkers, timeout: timeout, quiet: quiet)
         }
+    }
+
+    /// The command lock must already be held — `acquireCommandLock` is not reentrant.
+    private func sendCommandLocked(_ command: String, doneMarkers: [String], timeout: TimeInterval, quiet: Bool = false) async throws -> String {
         guard let stdinHandle, let process, process.isRunning else {
             throw GPhotoError.noCameraDetected
         }
@@ -1320,20 +1338,24 @@ actor GPhotoSession {
     }
 
     private func fetchSettingsOnce(_ paths: [String]) async throws -> [CameraSetting] {
-        var results: [CameraSetting] = []
-        for path in paths {
-            let output = try await sendCommand(
-                "get-config \(path)",
-                doneMarkers: ["END", "*** Error", "ERROR"],
-                timeout: 15
-            )
-            // A property the camera doesn't expose in its current mode yields no `Current:`
-            // line (parse returns nil); skip it rather than failing the whole fetch.
-            if let setting = CameraSetting.parse(from: output, path: path) {
-                results.append(setting)
+        // One lock for the whole read — see `withCommandLock`. Reading each property under its own
+        // acquisition made the inspector lag the camera's dials by seconds.
+        try await withCommandLock {
+            var results: [CameraSetting] = []
+            for path in paths {
+                let output = try await sendCommandLocked(
+                    "get-config \(path)",
+                    doneMarkers: ["END", "*** Error", "ERROR"],
+                    timeout: 15
+                )
+                // A property the camera doesn't expose in its current mode yields no `Current:`
+                // line (parse returns nil); skip it rather than failing the whole fetch.
+                if let setting = CameraSetting.parse(from: output, path: path) {
+                    results.append(setting)
+                }
             }
+            return results
         }
-        return results
     }
 
     /// Applies a new value to a single setting, then re-reads it so the caller gets the camera's

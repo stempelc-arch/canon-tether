@@ -165,7 +165,10 @@ final class CameraViewModel: ObservableObject {
     /// Settings poll cadence: brisk while live view is up so camera-side dial changes register
     /// against what's on screen, relaxed otherwise.
     private static let liveSettingsPoll: UInt64 = 1_200_000_000
-    private static let idleSettingsPoll: UInt64 = 4_000_000_000
+    /// Brisk enough that turning a dial on the camera shows up in the inspector while the
+    /// photographer is still looking at it. Affordable now that a whole settings read costs one
+    /// lock acquisition rather than five.
+    private static let idleSettingsPoll: UInt64 = 1_500_000_000
     /// Bumped whenever the photographer changes a setting, so an in-flight poll that started
     /// before the change discards its now-stale snapshot instead of publishing it.
     private var settingsGeneration: UInt64 = 0
