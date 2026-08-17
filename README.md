@@ -2,9 +2,18 @@
 
 A lightweight tethered-shooting macOS app for the Canon EOS-1D X Mark II over **wired Ethernet**
 (PTP/IP) or USB, built on [libgphoto2](http://www.gphoto.org/) — no Canon SDK, no Apple Developer
-account. Tethered capture, live camera settings control, RGB/luma waveform + vectorscope with gamut
-overlays, focus/exposure auto-checks, a client review monitor with slideshow, and Finder-tag-based
-pick flagging that travels with the files.
+account, and nothing to install alongside it.
+
+- **Tethered capture** from either shutter — the app's or the camera's — down the same path.
+- **Live view** (⌘L) for composing, with the **scopes measuring the live feed**, so exposure is set
+  against a real waveform instead of by eye. Taking a shot drops back to reviewing it.
+- **Settings from either end.** Change ISO, shutter, aperture and white balance in the app or on the
+  camera's own dials; each side reflects the other within a second or two.
+- **Waveform + vectorscope** (luma / parade / RGB) with sRGB, Adobe RGB and Display P3 gamut
+  overlays, and automatic **focus and exposure checks** on every frame.
+- **Client review monitor** — full-screen on a second display, with a slideshow of your picks.
+- **Picks are Finder tags** on the files themselves, so they show up in Finder and come back when
+  you reopen a project. No sidecar files.
 
 ## Install (prebuilt)
 
@@ -21,8 +30,16 @@ app, no Homebrew or Terminal needed.
 On the camera: Network settings → wired LAN → EOS Utility mode. Use **Manual** IP configuration —
 the app's "Manual Setup…" button (shown while disconnected) computes the exact values for your
 machine. Auto/DHCP also works but wastes minutes timing out against a DHCP server that doesn't
-exist on a direct cable. Pairing is driven from the camera's own screen; the app connects
-automatically once the camera appears on the link.
+exist on a direct cable.
+
+Pairing is completed **on the camera's own screen** — that's Canon's design, not an app
+limitation — so if the app says the camera is re-pairing, press "Start pairing devices" on the
+body and it will connect on its own. After a short power cycle it reconnects hands-free; after the
+camera has been off for hours, expect to confirm the pairing once.
+
+If you need the camera's dials completely to yourself, **⌘B** stops the app talking to it for 45
+seconds. In normal use you shouldn't need it: the app listens gently enough that the body stays
+responsive on its own.
 
 ## Build from source
 

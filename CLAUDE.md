@@ -185,6 +185,40 @@ follow-up SRV/A queries, so mDNS can tell you a camera exists and never tell you
 Discovery therefore stays on the ARP table (`arp -an`, see `networkCameraIP`). Don't rebuild a
 Bonjour path expecting faster discovery; the announcement is real but useless for addressing.
 
+## "Camera busy" is us, not the camera (2026-08-17)
+The body reports **busy and locks its own dials whenever the app polls hard**. It isn't a Canon
+policy about tethering — EOS Utility manages both ends fine. The old tether watch asked
+`wait-event-and-download 50ms` on a 30ms loop, i.e. ~12 commands/second, leaving no idle moment in
+which the camera could accept input. The listening window is now **adaptive** (`tetherWindow`):
+50ms while frames are arriving so bursts stay immediate, 1s once shooting goes quiet. Crucially a
+longer window is *not* slower listening — gphoto2 downloads a frame the instant the event arrives
+either way, and only the app's notification waits for the window to close — so the cost is up to a
+second of gallery delay on an idle body-shutter shot, and the gain is a camera usable in the
+photographer's hands. `⌘B` (Camera Control) additionally stops *all* polling for 45s; bounded
+because the link drops after ~90s of silence and a dropped link costs a re-pair.
+
+**Batch multi-command reads.** A settings read is five `get-config`s; with one lock acquisition
+each, every one queued behind a full tether window — the read cost ~5s and polls landed 6.3s apart,
+so a dial turned on the body reached the inspector six seconds later. `withCommandLock` +
+`sendCommandLocked` take the lock once for the whole batch (one wait, five fast commands), which
+also holds the camera for a single contiguous window instead of interleaving five times. That made
+a 1.5s poll affordable. Verified live: shutter changes made on the body now appear with no
+`set-config` behind them, ~1.6s apart.
+
+## Live scopes (2026-08-17)
+The waveform/vectorscope measure the live view feed while it's running, not just captures —
+`ScopeSampler.sample(_ image: CGImage,…)` shares the same float pipeline as the file path, so a
+live reading and the reading off the resulting capture are comparable rather than two different
+measurements. Sampled a few times a second at a smaller size (`liveScopeInterval`,
+`liveSampleSize`), because exposure doesn't change 8×/second and the plot has to be *read*.
+`ScopesPanel` holds `LiveViewFeed` as a **plain reference, not `@ObservedObject`** — observing it
+would reinstate the per-frame invalidation described below.
+
+**Never publish live view frames from `CameraViewModel`.** They live on their own `LiveViewFeed`
+object. On the shared view model, each frame invalidated the toolbar, inspector, filmstrip and the
+client review window — re-running the filmstrip's "good shots only" filter across the whole session
+8×/second.
+
 ## Live view (2026-08-17)
 `capture-preview` over the persistent shell, looped: each frame lands as a JPEG in the shell's cwd
 (the capture folder, since the interactive shell ignores `--filename`), is read, **deleted
