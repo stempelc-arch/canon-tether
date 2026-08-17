@@ -5,8 +5,21 @@ import ImageIO
 /// Loads a downsized `NSImage` off the main thread. Uses `ImageIO`'s thumbnail path, which pulls
 /// the embedded preview from RAW/CR2 files, so even 20 MB RAWs display near-instantly.
 enum PreviewLoader {
+    /// Decoded previews keyed by path+size. Capture files never change after import, so no
+    /// invalidation is needed; NSCache evicts under memory pressure. Without this the filmstrip
+    /// re-decoded RAW previews every time LazyHStack recycled a cell, and the client slideshow
+    /// re-decoded the same flagged set at full hero size every interval, forever — constant disk
+    /// and CPU burn across a multi-hour review.
+    private static let cache: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.totalCostLimit = 400_000_000 // ~400MB of decoded pixels, evicted under pressure
+        return cache
+    }()
+
     static func load(_ url: URL, maxPixel: Int) async -> NSImage? {
-        await withCheckedContinuation { continuation in
+        let keyString = "\(url.path)|\(maxPixel)"
+        if let cached = cache.object(forKey: keyString as NSString) { return cached }
+        return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
                     continuation.resume(returning: nil); return
@@ -19,7 +32,9 @@ enum PreviewLoader {
                 guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
                     continuation.resume(returning: nil); return
                 }
-                continuation.resume(returning: NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height)))
+                let image = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+                cache.setObject(image, forKey: keyString as NSString, cost: cg.width * cg.height * 4)
+                continuation.resume(returning: image)
             }
         }
     }

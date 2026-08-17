@@ -275,6 +275,8 @@ public enum ScopeRenderer {
         x: Int, value: Double, layer: Int
     ) {
         guard x >= 0, x < width else { return }
+        // A NaN pixel (corrupt/truncated file) survives min/max clamping and traps in Int() below.
+        guard value.isFinite else { return }
         let clamped = min(max(value, 0), 1)
         let row = Int((1 - clamped) * Double(height - 1))
         out[(row * width + x) * 3 + layer] += 1
@@ -301,6 +303,8 @@ public enum ScopeRenderer {
                     // Already normalised, and extended-range: wide-gamut pixels sit outside [0, 1]
                     // and so plot beyond the sRGB hexagon — which is the whole point of the overlay.
                     let r = Double(src[p]), g = Double(src[p + 1]), b = Double(src[p + 2])
+                    // Non-finite pixels (corrupt file) would trap in the Int() conversions below.
+                    guard r.isFinite, g.isFinite, b.isFinite else { continue }
                     let y = lumaR * r + lumaG * g + lumaB * b
                     let cb = (b - y) / cbScale
                     let cr = (r - y) / crScale

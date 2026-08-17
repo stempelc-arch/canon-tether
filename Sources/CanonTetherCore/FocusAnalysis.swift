@@ -88,7 +88,9 @@ public enum FocusAnalyzer {
     /// is sharp, `< softThreshold` is soft, between is borderline.
     public static func evaluate(_ frame: ScopeFrame, sharpThreshold: Int, softThreshold: Int) -> FocusResult {
         let (peakSharpness, peak) = measure(frame)
-        let score = min(max(Int((100 * peakSharpness / (peakSharpness + halfScoreRatio)).rounded()), 0), 100)
+        let raw = 100 * peakSharpness / (peakSharpness + halfScoreRatio)
+        // Int(NaN) traps — a corrupt frame's sharpness ratio must not crash the app.
+        let score = raw.isFinite ? min(max(Int(raw.rounded()), 0), 100) : 0
         return FocusResult(
             score: score,
             verdict: verdict(for: score, sharpThreshold: sharpThreshold, softThreshold: softThreshold),

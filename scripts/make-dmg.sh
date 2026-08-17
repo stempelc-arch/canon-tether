@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 APP="CanonTether.app"
-VERSION="1.0"
+VERSION="$(source "$ROOT/scripts/version.sh" && echo "$CANONTETHER_VERSION")"
 DMG_NAME="CanonTether-${VERSION}.dmg"
 STAGING="dist/dmg-staging"
 

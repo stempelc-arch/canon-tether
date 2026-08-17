@@ -117,7 +117,10 @@ public enum ExposureAnalyzer {
                 let y = lumaR * Double(src[p]) + lumaG * Double(src[p + 1]) + lumaB * Double(src[p + 2])
                 // Extended-range values (wide gamut) can land outside [0, 1]; clamp into the rails,
                 // which is the honest read for exposure — anything past 1 is blown either way.
-                let bin = min(max(Int(y * Double(last)), 0), last)
+                // Clamp BEFORE the Int conversion: Int(NaN) and Int(huge) both trap, so a single
+                // corrupt pixel would otherwise crash the app mid-shoot.
+                guard y.isFinite else { continue }
+                let bin = Int(min(max(y, 0), 1) * Double(last))
                 histogram[bin] += 1
             }
         }

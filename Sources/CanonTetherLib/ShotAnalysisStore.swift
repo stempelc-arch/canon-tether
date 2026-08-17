@@ -2,6 +2,14 @@ import Foundation
 import Combine
 import CanonTetherCore
 
+/// The single serial queue every Finder-tag read-modify-write must go through. Tag persistence has
+/// two writers — flag toggles (ReviewModel) and analysis verdicts (ShotAnalysisStore) — and each
+/// does a read-modify-write of the same tag list; unserialized, an analysis persist that read the
+/// list just before a flag toggle wrote it would clobber the pick right back off the file.
+enum FinderTagQueue {
+    static let queue = DispatchQueue(label: "com.canontether.finder-tags", qos: .userInitiated)
+}
+
 /// Scores each capture for **focus** and **exposure**, and remembers both verdicts *on the file* the
 /// way flags are kept — native macOS **Finder tags** (visible/filterable in Finder and Spotlight)
 /// plus the exact readings in custom **extended attributes**. No sidecar: the verdicts travel with
@@ -169,7 +177,7 @@ final class ShotAnalysisStore: ObservableObject {
 
     nonisolated private static func persist(focus: FocusResult?, exposure: ExposureResult?, to url: URL) async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            DispatchQueue.global(qos: .utility).async {
+            FinderTagQueue.queue.async {
                 if let focus { writeFocusScore(focus.score, to: url) }
                 if let exposure { writeExposure(exposure, to: url) }
                 // Tags share one read/write of the file's tag set so focus and exposure don't clobber

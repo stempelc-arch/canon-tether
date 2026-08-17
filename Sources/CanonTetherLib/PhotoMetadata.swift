@@ -38,7 +38,9 @@ struct PhotoMetadata: Equatable {
         if let f = exif?[kCGImagePropertyExifFNumber] as? Double {
             meta.aperture = f == f.rounded() ? "f/\(Int(f))" : String(format: "f/%.1f", f)
         }
-        if let t = exif?[kCGImagePropertyExifExposureTime] as? Double {
+        // t must be strictly positive and finite: malformed EXIF with ExposureTime 0 makes 1/t
+        // infinite, and Int(inf) traps — one bad file would crash the app whenever it's shown.
+        if let t = exif?[kCGImagePropertyExifExposureTime] as? Double, t > 0, t.isFinite {
             meta.shutter = t >= 1 ? String(format: "%.0f\"", t) : "1/\(Int((1 / t).rounded()))"
         }
         if let isoList = exif?[kCGImagePropertyExifISOSpeedRatings] as? [Int], let iso = isoList.first {

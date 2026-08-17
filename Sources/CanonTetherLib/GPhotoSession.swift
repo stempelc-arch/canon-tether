@@ -15,10 +15,14 @@ enum CaptureLocation {
     /// ~/Pictures/CanonTether. Read once per session (at `GPhotoSession` init), so changing it in
     /// Preferences applies to the next launch.
     static var directory: URL {
+        // Symlinks resolved so URL identity is stable: a chosen folder whose path traverses a
+        // symlink (/var vs /private/var — the classic) would otherwise give seeded-gallery URLs
+        // and live-capture URLs different string identities, silently breaking every == and Set
+        // comparison (flags, selection, trash, analysis lookups).
         if let path = UserDefaults.standard.string(forKey: userDefaultsKey), !path.isEmpty {
-            return URL(fileURLWithPath: path)
+            return URL(fileURLWithPath: path).resolvingSymlinksInPath()
         }
-        return defaultDirectory
+        return defaultDirectory.resolvingSymlinksInPath()
     }
 
     /// File extensions the app treats as reviewable captures.
@@ -87,6 +91,7 @@ actor GPhotoSession {
 
     private var process: Process?
     private var stdinHandle: FileHandle?
+    private var stdoutHandle: FileHandle?
     private let buffer = OutputBuffer()
     private var isConnected = false
     private var progressContinuation: AsyncStream<String>.Continuation?
@@ -166,6 +171,10 @@ actor GPhotoSession {
 
     private func setConnectedContinuation(_ continuation: AsyncStream<Bool>.Continuation) {
         connectedContinuation = continuation
+        // The registration Task races the first connect: a fast connect can markConnected(true)
+        // before this runs, and that event would be lost — the UI would show disconnected until
+        // the next transition. Seed the stream with the current state so no listener starts stale.
+        continuation.yield(isConnected)
     }
 
     /// Single choke point for the connection flag so every up/down transition is broadcast.
@@ -191,8 +200,10 @@ actor GPhotoSession {
     /// reaches the UI — gphoto2's send/recv chatter is for debugging the wired-LAN drops, not for
     /// the photographer to read mid-shoot. The status pill gets only what `status` publishes.
     private func log(_ message: String) {
+        #if DEBUG
         let timestamp = DateFormatter.logFormatter.string(from: Date())
         print("[\(timestamp)] \(message)")
+        #endif
         FileHandle.appendLog(message)
     }
 
@@ -215,7 +226,10 @@ actor GPhotoSession {
         guard let output = try? runOneShot(binary, ["--auto-detect"]) else { return nil }
         let lines = output.split(separator: "\n").dropFirst(2)
         guard let cameraLine = lines.first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }),
-              let port = cameraLine.split(separator: " ").last else {
+              let port = cameraLine.split(separator: " ").last,
+              port.hasPrefix("usb:") else {
+            // Unexpected output shapes (libusb warnings, banners) would otherwise yield a garbage
+            // token passed straight to --port, burning the full readyTimeout against it.
             return nil
         }
         return String(port)
@@ -295,8 +309,13 @@ actor GPhotoSession {
         // polling that's supposed to run about once a second.
         let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
+        // SIGTERM can be ignored by a child wedged in an uninterruptible USB ioctl, which would
+        // block waitUntilExit() — and this whole actor — forever. Escalate to SIGKILL.
+        let killer = DispatchWorkItem { if process.isRunning { kill(process.processIdentifier, SIGKILL) } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout + 3, execute: killer)
         process.waitUntilExit()
         watchdog.cancel()
+        killer.cancel()
         readGroup.wait()
         let outData = results[0] as! Data
         let errData = results[1] as! Data
@@ -312,8 +331,20 @@ actor GPhotoSession {
     /// Spawns `gphoto2 --shell` against `port` and waits for a `summary` response to confirm
     /// the camera actually answered (including waiting out the on-camera confirmation prompt).
     private func openShell(port: String) async -> Bool {
-        let binary = (try? binaryPath()) ?? "/usr/local/bin/gphoto2"
-        try? FileManager.default.createDirectory(at: captureDirectory, withIntermediateDirectories: true)
+        // No hardcoded fallback path: if gphoto2 disappears mid-session (brew uninstall) the retry
+        // loop would otherwise spin silently against a nonexistent binary forever.
+        guard let binary = try? binaryPath() else {
+            status("gphoto2 not found — install it with: brew install libgphoto2 gphoto2")
+            return false
+        }
+        do {
+            try FileManager.default.createDirectory(at: captureDirectory, withIntermediateDirectories: true)
+        } catch {
+            // An unreachable capture folder (unplugged external drive) would otherwise wedge the
+            // connect loop in a silent infinite retry with the pill stuck on "Connecting…".
+            status("Capture folder unavailable — choose a new one in Preferences")
+            return false
+        }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: binary)
         proc.arguments = ["--port", port, "--shell"]
@@ -350,6 +381,8 @@ actor GPhotoSession {
 
         process = proc
         stdinHandle = stdin.fileHandleForWriting
+        stdoutHandle = stdout.fileHandleForReading
+        ChildProcessRegistry.shared.register(proc)
         try? stdinHandle?.write(contentsOf: "summary\n".data(using: .utf8)!)
 
         let deadline = Date().addingTimeInterval(Self.readyTimeout)
@@ -372,6 +405,10 @@ actor GPhotoSession {
                 return false
             }
             if !proc.isRunning {
+                closeShell()
+                return false
+            }
+            if Task.isCancelled {
                 closeShell()
                 return false
             }
@@ -431,6 +468,13 @@ actor GPhotoSession {
             }
             try? stdinHandle.close()
         }
+        // Detach the pipe callback *before* terminating: the dying shell's final flush (error
+        // text like "Connection reset") would otherwise land in the shared buffer after the next
+        // openShell's clear() and be mistaken for the new shell's output — seen tearing down a
+        // perfectly good new connection whose handshake poll matched the stale "ERROR" text.
+        stdoutHandle?.readabilityHandler = nil
+        try? stdoutHandle?.close()
+        stdoutHandle = nil
         process?.terminate()
         process = nil
         stdinHandle = nil
@@ -526,8 +570,13 @@ actor GPhotoSession {
         // notice the session is down at once) so we never spawn two gphoto2 shells at the camera.
         while isEstablishing {
             try? await Task.sleep(nanoseconds: 200_000_000)
+            try Task.checkCancellation()
             if isConnected, let process, process.isRunning { return }
         }
+        // Re-check after the wait: the establisher may have finished successfully in the window
+        // since this waiter's last in-loop check — proceeding would open a second gphoto2 shell
+        // against an already-connected camera and orphan the first one.
+        if isConnected, let process, process.isRunning { return }
         isEstablishing = true
         defer { isEstablishing = false }
 
@@ -601,6 +650,10 @@ actor GPhotoSession {
                     log("waiting for camera to appear (\(waited)s)...")
                 }
             }
+            // `try?` on the sleeps above swallows CancellationError, so a cancelled task would
+            // otherwise degenerate into a hot spin — zero-length sleeps hammering networkCameraIP()
+            // (one spawned `arp` process per iteration) at 100% of a thread, forever.
+            try Task.checkCancellation()
             try? await Task.sleep(nanoseconds: Self.cameraWaitInterval)
             waited += 1
         }
@@ -622,18 +675,30 @@ actor GPhotoSession {
 
         let deadline = Date().addingTimeInterval(timeout)
         var lastLoggedSnapshot = ""
-        var answeredOverwritePrompt = false
+        var answeredOverwritePrompts = 0
         while Date() < deadline {
             let snapshot = buffer.snapshot()
             if snapshot != lastLoggedSnapshot {
-                if !quiet { log("recv so far: \(snapshot.debugDescription)") }
+                // Log only the newly-arrived suffix, not the whole accumulated buffer — re-logging
+                // the full snapshot on every change made a long command's output superlinear in the
+                // log file (a big contributor to unbounded log growth).
+                if !quiet {
+                    let delta = snapshot.hasPrefix(lastLoggedSnapshot)
+                        ? String(snapshot.dropFirst(lastLoggedSnapshot.count))
+                        : snapshot
+                    log("recv: \(delta.debugDescription)")
+                }
                 lastLoggedSnapshot = snapshot
             }
             // The interactive shell sometimes asks to overwrite its own intermediate download
             // filename ("File captNNNN.cr2 exists. Overwrite? [y|n]") even with --force-overwrite,
             // since that flag only covers the final destination file, not this internal prompt.
-            if !answeredOverwritePrompt, snapshot.contains("[y|n]") {
-                answeredOverwritePrompt = true
+            // A RAW+JPEG capture can prompt once per file, so answer every prompt, not just the
+            // first — an unanswered second prompt hangs the command into the timeout and a full
+            // shell teardown.
+            let promptCount = snapshot.components(separatedBy: "[y|n]").count - 1
+            if promptCount > answeredOverwritePrompts {
+                answeredOverwritePrompts = promptCount
                 log("answering overwrite prompt: y")
                 try? stdinHandle.write(contentsOf: "y\n".data(using: .utf8)!)
             }
@@ -645,6 +710,7 @@ actor GPhotoSession {
                 markConnected(false)
                 throw GPhotoError.commandFailed("Camera session closed unexpectedly:\n\(snapshot)")
             }
+            try Task.checkCancellation()
             try? await Task.sleep(nanoseconds: Self.pollInterval)
         }
         // A timeout likely means the session is desynced (e.g. the camera's pairing was reset
@@ -869,10 +935,14 @@ actor GPhotoSession {
         for attempt in 1...3 {
             // `capture-image-and-download` is the command proven working on this body; route its
             // result through the shared import path so it lands via `captureStream` exactly like a
-            // camera-shutter frame the watcher downloads.
+            // camera-shutter frame the watcher downloads. Completion is the shell prompt returning
+            // (like the tether poll), NOT the first "Saving file as" — with the body set to
+            // RAW+JPEG the second file's save line arrives after the first, and returning early
+            // let the next command's buffer clear() destroy it, stranding the file under its
+            // camera-side name outside the gallery.
             let output = try await sendCommand(
                 "capture-image-and-download --force-overwrite",
-                doneMarkers: ["Saving file as", "ERROR", "*** Error"],
+                doneMarkers: ["gphoto2:", "ERROR", "*** Error"],
                 timeout: 60
             )
             let names = CaptureOutput.savedFilenames(in: output)
@@ -908,6 +978,34 @@ extension DateFormatter {
     }()
 }
 
+/// Tracks live gphoto2 child processes so app termination can kill them synchronously. Without
+/// this, quitting the app reparents the `gphoto2 --shell` child to launchd with its PTP/IP session
+/// still open — the camera stays claimed by a ghost until the orphan is manually killed, and
+/// relaunching the app can't connect. Called from `applicationWillTerminate`, which cannot await
+/// into the actor, hence a lock-protected registry outside actor isolation.
+public final class ChildProcessRegistry: @unchecked Sendable {
+    public static let shared = ChildProcessRegistry()
+    private let lock = NSLock()
+    private var processes: [Process] = []
+
+    func register(_ process: Process) {
+        lock.lock()
+        processes.removeAll { !$0.isRunning }
+        processes.append(process)
+        lock.unlock()
+    }
+
+    public func terminateAll() {
+        lock.lock()
+        let live = processes
+        processes.removeAll()
+        lock.unlock()
+        for process in live where process.isRunning {
+            process.terminate()
+        }
+    }
+}
+
 /// Thread-safe text accumulator shared between the actor and the background pipe-reading
 /// callback, deliberately kept outside `GPhotoSession`'s actor isolation.
 private final class OutputBuffer: @unchecked Sendable {
@@ -931,14 +1029,24 @@ extension FileHandle {
     private static let logURL = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Logs/CanonTether.log")
 
+    /// Rotate once the log passes this size: current → .old (replacing the previous .old), so at
+    /// most ~2x this ever sits on disk. Without a cap the file grows for the life of the install
+    /// (hit 50MB in one week of dev use).
+    private static let logRotateBytes: UInt64 = 5_000_000
+
     static func appendLog(_ message: String) {
         let line = "[\(DateFormatter.logFormatter.string(from: Date()))] \(message)\n"
         guard let data = line.data(using: .utf8) else { return }
         try? FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         if let handle = try? FileHandle(forWritingTo: logURL) {
-            handle.seekToEndOfFile()
+            let size = handle.seekToEndOfFile()
             handle.write(data)
             try? handle.close()
+            if size > logRotateBytes {
+                let old = logURL.deletingPathExtension().appendingPathExtension("old.log")
+                try? FileManager.default.removeItem(at: old)
+                try? FileManager.default.moveItem(at: logURL, to: old)
+            }
         } else {
             try? data.write(to: logURL)
         }

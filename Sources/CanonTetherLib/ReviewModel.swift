@@ -137,9 +137,10 @@ final class ReviewModel: ObservableObject {
         if selectedURL == nil || mainViewerMode == .latest {
             selectedURL = captures.last
         }
-        if mode == .slideshow {
-            restartSlideshow()
-        }
+        // Deliberately NOT restarting the slideshow here: restart zeroes the index, and during
+        // active shooting every arriving frame triggers a sync — the client slideshow would snap
+        // back to the first flagged shot forever, never advancing. The timer keeps its own pace
+        // and re-reads the flagged list live each tick, so it needs no nudge from capture churn.
     }
 
     /// The assistant taps/scrubs to a shot to inspect and flag it: holds the main viewer on it. In
@@ -177,31 +178,36 @@ final class ReviewModel: ObservableObject {
     private var flagKnown: Set<URL> = []
 
     func loadFlags(from captures: [URL]) {
-        for url in captures where !flagKnown.contains(url) {
-            flagKnown.insert(url)
-            if let tags = try? url.resourceValues(forKeys: [.tagNamesKey]).tagNames,
-               tags.contains(Self.flagTag) {
-                flagged.insert(url)
+        let unknown = captures.filter { !flagKnown.contains($0) }
+        guard !unknown.isEmpty else { return }
+        flagKnown.formUnion(unknown)
+        // The xattr reads run off the main actor: opening a 1,000+-file project would otherwise do
+        // that many synchronous filesystem reads in one main-thread pass — a visible UI freeze.
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let found = unknown.filter { url in
+                (try? url.resourceValues(forKeys: [.tagNamesKey]).tagNames)?.contains(Self.flagTag) == true
             }
+            guard !found.isEmpty else { return }
+            await MainActor.run { [weak self] in self?.flagged.formUnion(found) }
         }
     }
 
-    /// Toggles the "Flagged" Finder tag on a capture and mirrors it into the in-memory set.
+    /// Toggles the "Flagged" Finder tag on a capture and mirrors it into the in-memory set. The
+    /// on-disk read-modify-write goes through `FinderTagQueue` so it can't interleave with an
+    /// analysis persist touching the same file's tag list (which would silently drop the pick).
     func toggleFlag(_ url: URL?) {
         guard let url else { return }
-        var tags = (try? url.resourceValues(forKeys: [.tagNamesKey]).tagNames) ?? []
-        if flagged.contains(url) {
-            tags.removeAll { $0 == Self.flagTag }
-            flagged.remove(url)
-        } else {
-            if !tags.contains(Self.flagTag) { tags.append(Self.flagTag) }
-            flagged.insert(url)
-        }
-        // `URLResourceValues.tagNames` is read-only; the writable path is NSURL's key-based setter.
-        try? (url as NSURL).setResourceValue(tags, forKey: .tagNamesKey)
-
-        if mode == .slideshow {
-            restartSlideshow()
+        let shouldFlag = !flagged.contains(url)
+        if shouldFlag { flagged.insert(url) } else { flagged.remove(url) }
+        FinderTagQueue.queue.async {
+            var tags = (try? url.resourceValues(forKeys: [.tagNamesKey]).tagNames) ?? []
+            if shouldFlag {
+                if !tags.contains(Self.flagTag) { tags.append(Self.flagTag) }
+            } else {
+                tags.removeAll { $0 == Self.flagTag }
+            }
+            // `URLResourceValues.tagNames` is read-only; the writable path is NSURL's key setter.
+            try? (url as NSURL).setResourceValue(tags, forKey: .tagNamesKey)
         }
     }
 

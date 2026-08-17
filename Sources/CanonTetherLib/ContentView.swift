@@ -147,7 +147,9 @@ public struct ContentView: View {
                 Label("Export Flagged", systemImage: "square.and.arrow.up")
             }
             .help("Copy the flagged picks to a folder")
-            .disabled(reviewModel.flaggedOrdered(in: viewModel.captures).isEmpty)
+            // Just the emptiness check — building the full ordered list (filter + reverse over
+            // every capture) twice per render was measurable steady-state work on big sessions.
+            .disabled(reviewModel.flagged.isEmpty)
         }
     }
 
@@ -480,6 +482,7 @@ private struct ZoomableImageView: View {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
                 guard !isZoomed else { return }
+                ensureFullImage()
                 loupeCursor = value.location
             }
             .onEnded { _ in loupeCursor = nil }
@@ -487,7 +490,10 @@ private struct ZoomableImageView: View {
 
     private func magnification(in size: CGSize) -> some Gesture {
         MagnificationGesture()
-            .onChanged { value in scale = clampScale(lastScale * value) }
+            .onChanged { value in
+                ensureFullImage()
+                scale = clampScale(lastScale * value)
+            }
             .onEnded { _ in
                 lastScale = scale
                 if !isZoomed { resetPan() } else { offset = clampOffset(offset, in: size); lastOffset = offset }
@@ -510,6 +516,7 @@ private struct ZoomableImageView: View {
         if isZoomed {
             scale = 1; lastScale = 1; resetPan()
         } else {
+            ensureFullImage()
             scale = 2.5; lastScale = 2.5
         }
     }
@@ -526,11 +533,28 @@ private struct ZoomableImageView: View {
     }
 
     private func load() async {
+        let target = url
         scale = 1; lastScale = 1; resetPan()
         fullImage = nil
-        fitImage = await PreviewLoader.load(url, maxPixel: 2200)
-        // Full-resolution copy for crisp pixel-peeping; loaded after the quick preview is showing.
-        fullImage = await PreviewLoader.load(url, maxPixel: 6000)
+        let fit = await PreviewLoader.load(target, maxPixel: 2200)
+        // Rapid scrubbing/bursts restart this task with a new url; a stale load resuming later
+        // must not overwrite the current photo with the previous one.
+        guard target == url else { return }
+        fitImage = fit
+        // The full-resolution copy is NOT loaded here: decoding ~6000px (~100MB RGBA) on every
+        // displayed shot — zoomed or not — stacked hundred-MB decodes during bursts for pixels
+        // nobody looked at. It loads on demand the moment zoom or the loupe is engaged.
+    }
+
+    /// Kicks off the full-resolution load the first time zoom or the loupe actually needs it.
+    private func ensureFullImage() {
+        guard fullImage == nil else { return }
+        let target = url
+        Task {
+            let image = await PreviewLoader.load(target, maxPixel: 6000)
+            guard target == url else { return }
+            fullImage = image
+        }
     }
 }
 
@@ -805,6 +829,10 @@ private struct SessionFilmstrip: View {
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 24)
             } else {
+                // Computed once per render, not once per thumbnail: in slideshow mode
+                // displayedURL filters the whole capture array, so evaluating it inside the
+                // ForEach made every published change O(captures × visible thumbs).
+                let clientURL = reviewModel.displayedURL(in: viewModel.captures)
                 ScrollViewReader { proxy in
                     ScrollView(.horizontal, showsIndicators: false) {
                         LazyHStack(spacing: 10) {
@@ -813,7 +841,7 @@ private struct SessionFilmstrip: View {
                                     url: url,
                                     isSelected: url == reviewModel.selectedURL,
                                     isFlagged: reviewModel.isFlagged(url),
-                                    isOnClient: url == reviewModel.displayedURL(in: viewModel.captures),
+                                    isOnClient: url == clientURL,
                                     focusResult: analysis.focus[url],
                                     exposureResult: analysis.exposure[url],
                                     onSelect: { reviewModel.hold(url) },

@@ -74,6 +74,10 @@ final class CameraViewModel: ObservableObject {
     private func refreshSettingsIfIdle() async {
         guard isConnected, !isBusy else { return }
         guard let latest = try? await session.fetchSettings(), !latest.isEmpty else { return }
+        // Re-check after the await: a user-initiated change can start (and finish) while the fetch
+        // was in flight, and applying the stale snapshot would snap the just-changed value back in
+        // the inspector until the next poll.
+        guard !isBusy else { return }
         // Equatable guard avoids churning the inspector (and closing open menus) when nothing changed.
         if latest != settings {
             settings = latest
@@ -81,6 +85,10 @@ final class CameraViewModel: ObservableObject {
     }
 
     private func handleNewCapture(_ url: URL) {
+        // A frame downloaded just before a project switch can arrive after the gallery was
+        // repointed — dropping it keeps an old project's photo (and the client monitor) from
+        // leaking into the new project's session. The file itself is safe in its own folder.
+        guard url.deletingLastPathComponent() == CaptureLocation.directory else { return }
         captures.append(url)
         lastCaptureURL = url
         captureCount += 1
@@ -96,7 +104,14 @@ final class CameraViewModel: ObservableObject {
     /// Moves a capture to the Trash (recoverable) and drops it from the session gallery. The review
     /// model re-syncs off the resulting `captures` change, so selection/flags stay consistent.
     func moveToTrash(_ url: URL) {
-        try? FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        do {
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        } catch {
+            // Don't drop it from the gallery if it wasn't actually trashed (volume without a
+            // .Trashes, permissions) — the photo would vanish from the UI while staying on disk.
+            statusText = "Couldn't move \(url.lastPathComponent) to Trash"
+            return
+        }
         captures.removeAll { $0 == url }
         if lastCaptureURL == url {
             lastCaptureURL = captures.last
@@ -121,8 +136,16 @@ final class CameraViewModel: ObservableObject {
 
         var copied = 0
         for url in urls {
-            let target = destination.appendingPathComponent(url.lastPathComponent)
-            try? FileManager.default.removeItem(at: target)
+            var target = destination.appendingPathComponent(url.lastPathComponent)
+            // Never delete what's already at the destination: the old remove-then-copy destroyed
+            // any same-named file (unrecoverably — removed, not trashed), and exporting into the
+            // capture folder itself made target == source, deleting the original pick outright.
+            if target == url { continue }
+            if FileManager.default.fileExists(atPath: target.path) {
+                let base = url.deletingPathExtension().lastPathComponent
+                target = destination.appendingPathComponent(
+                    base + "-" + UUID().uuidString.prefix(4) + "." + url.pathExtension)
+            }
             do {
                 try FileManager.default.copyItem(at: url, to: target)
                 copied += 1
@@ -145,18 +168,23 @@ final class CameraViewModel: ObservableObject {
         ) else { return }
 
         let images = urls.filter { CaptureLocation.imageExtensions.contains($0.pathExtension.lowercased()) }
-        captures = images.sorted { lhs, rhs in
-            let lDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            let rDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            return lDate < rDate
+        // Fetch each date once before sorting — stat-ing inside the comparator did O(n log n)
+        // syscalls (10,000+ for a 1,000-file folder) on the main actor, a visible beachball on
+        // every launch and project switch.
+        let dated = images.map { url in
+            (url, (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
         }
+        captures = dated.sorted { $0.1 < $1.1 }.map(\.0)
         lastCaptureURL = captures.last
     }
 
     func connect() {
         run {
             try await self.session.connect()
-            self.isConnected = true
+            // isConnected is deliberately NOT set here: connectionStream is the single writer.
+            // Setting it directly could overwrite a `false` the stream just delivered (the link
+            // can drop in the window between connect() returning and this continuation resuming),
+            // showing "connected" against a dead session.
             self.statusText = "Connected"
             self.settings = try await self.session.fetchSettings()
         }
@@ -171,7 +199,8 @@ final class CameraViewModel: ObservableObject {
     /// come with them: flags are stored as macOS Finder tags on the files themselves, so reloading
     /// the folder reloads the picks with no sidecar files to keep in sync. Relaunches the camera
     /// shell against the new folder if it was connected, so future shots land in the right place.
-    func changeCaptureFolder(_ url: URL) {
+    func changeCaptureFolder(_ rawURL: URL) {
+        let url = rawURL.resolvingSymlinksInPath()
         guard url != CaptureLocation.directory else { return }
         UserDefaults.standard.set(url.path, forKey: CaptureLocation.userDefaultsKey)
 
@@ -185,17 +214,13 @@ final class CameraViewModel: ObservableObject {
         statusText = "Switched to \(url.lastPathComponent)"
         loadExistingCaptures()
 
-        // Route through `run` so this can't race a concurrent capture/settings update — both
-        // write `isConnected`/`settings`/`errorMessage`, and only `run` gates that with `isBusy`.
-        run {
-            let wasConnected = self.isConnected
+        // Deliberately NOT routed through `run`: its isBusy guard silently *discarded* the repoint
+        // whenever a connect/capture was in flight — the gallery showed the new project while every
+        // subsequent shot kept downloading into the old folder. The session actor serializes with
+        // any in-flight command on its own, and the self-healing tether loop relaunches the shell
+        // against the new folder within ~1s, so no reconnect choreography is needed here.
+        Task {
             await self.session.setCaptureDirectory(url)
-            // Proactively relaunch against the new working directory when we had a live session;
-            // otherwise the normal connect flow (and the self-healing tether loop) will pick it up.
-            guard wasConnected else { return }
-            try await self.session.connect()
-            self.isConnected = true
-            self.settings = try await self.session.fetchSettings()
         }
     }
 

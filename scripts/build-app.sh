@@ -12,7 +12,8 @@ cd "$ROOT"
 APP="CanonTether.app"
 CONTENTS="$APP/Contents"
 BUNDLE_ID="com.canontether.app"
-VERSION="1.0"
+# Single source of truth for the version — make-dmg.sh reads it from here via scripts/version.sh.
+VERSION="$(source "$ROOT/scripts/version.sh" && echo "$CANONTETHER_VERSION")"
 
 echo "==> Building release binary…"
 swift build -c release
@@ -55,12 +56,16 @@ cat > "$CONTENTS/Info.plist" <<PLIST
     <key>LSApplicationCategoryType</key>    <string>public.app-category.photography</string>
     <key>NSHighResolutionCapable</key>      <true/>
     <key>NSPrincipalClass</key>             <string>NSApplication</string>
+    <key>NSHumanReadableCopyright</key>     <string>© 2026</string>
 </dict>
 </plist>
 PLIST
 
-# Ad-hoc sign so the app runs without the "damaged" error on modern macOS (still unsigned re: Apple).
-codesign --force --deep --sign - "$APP" 2>/dev/null || echo "   (codesign skipped)"
+# Ad-hoc sign so the app runs without the "damaged" error on modern macOS (still unsigned re:
+# Apple). This must HARD-FAIL: on Apple Silicon an app with no signature at all (not even ad-hoc)
+# is killed by the kernel on launch with no dialog — a silently-skipped codesign would ship a DMG
+# whose app instantly dies on M-series Macs.
+codesign --force --deep --sign - "$APP"
 
 echo "==> Done: $ROOT/$APP"
 echo "    First launch: right-click the app → Open (unsigned app, Gatekeeper bypass)."
