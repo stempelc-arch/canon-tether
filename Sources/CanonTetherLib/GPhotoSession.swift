@@ -92,6 +92,9 @@ actor GPhotoSession {
     /// suggesting what to check.
     private static let waitingHintDelay = 30
     private static let connectRetryDelay: UInt64 = 1_000_000_000
+    /// Ceiling for the refusal back-off — long enough to stop hammering a camera that isn't
+    /// listening, short enough that the reconnect still feels immediate once it is.
+    private static let maxConnectRetryDelay: UInt64 = 8_000_000_000
     // Kept tight: this is the granularity at which every shell command's completion is noticed,
     // including capture and download, so it's pure added latency on top of the camera's own work.
     private static let pollInterval: UInt64 = 20_000_000
@@ -318,6 +321,8 @@ actor GPhotoSession {
             .map { "\(prefix).\($0)" }
     }
 
+    /// Consecutive fast refusals, driving the connect back-off.
+    private var consecutiveRefusals = 0
     private var solicitCycle = 0
     private static let neighbourSweepEvery = 5
     private static let maxSolicitsPerCycle = 5
@@ -684,6 +689,7 @@ actor GPhotoSession {
                     }
                     log("attempt \(attempt)/\(Self.connectRetryAttempts): connecting to ptpip:\(ip)")
                     if await openShell(port: "ptpip:\(ip)") {
+                        consecutiveRefusals = 0
                         // Remember where it answered: next session can solicit this address
                         // directly rather than waiting for an announcement that may never come.
                         UserDefaults.standard.set(ip, forKey: Self.lastKnownIPKey)
@@ -700,9 +706,19 @@ actor GPhotoSession {
                     if freshIP != ip {
                         log("camera moved to \(freshIP) mid-retry — reconnecting there instead")
                         ip = freshIP
+                        consecutiveRefusals = 0
                         continue
                     }
-                    try? await Task.sleep(nanoseconds: Self.connectRetryDelay)
+                    // Back off when the camera is refusing outright (a failure that returns in ~2s
+                    // rather than hanging): that's a body whose PTP service isn't up yet, usually
+                    // because it's still working through its own pairing. Retrying 30 times a
+                    // minute doesn't make it ready sooner, and this camera is demonstrably touchy
+                    // about connection churn during pairing (see CLAUDE.md). Ramp 1s → 8s and stay
+                    // there, so we still catch it promptly once it does start listening.
+                    consecutiveRefusals += 1
+                    let backoff = min(Self.connectRetryDelay << min(consecutiveRefusals / 3, 3),
+                                      Self.maxConnectRetryDelay)
+                    try? await Task.sleep(nanoseconds: backoff)
                 }
             } else {
                 // No camera on the network. `gphoto2 --auto-detect` (the USB probe) is slow, so run
