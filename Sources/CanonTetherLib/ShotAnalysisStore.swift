@@ -147,6 +147,10 @@ final class ShotAnalysisStore: ObservableObject {
         guard flushTask == nil else { return }
         flushTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: Self.flushInterval)
+            // `try?` swallows cancellation, so without this a cancelled flush still runs and
+            // clears `flushTask` — orphaning a newer flush task that is still pending and letting
+            // a third be scheduled alongside it.
+            guard !Task.isCancelled else { return }
             self?.flushPending()
         }
     }

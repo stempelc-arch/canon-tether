@@ -124,7 +124,10 @@ public struct ContentView: View {
                   ? "Live view is on — click to go back to reviewing shots (⌘L)"
                   : "Show the camera's live view for composing (⌘L)")
             .keyboardShortcut("l", modifiers: .command)
-            .disabled(!viewModel.isConnected)
+            // Turning live view *off* must never need a connection: the wired link resets
+            // routinely, and gating both directions left the canvas stuck on a frozen frame with
+            // the only way back to reviewing shots greyed out.
+            .disabled(!viewModel.isConnected && !viewModel.isLiveViewOn)
         }
 
         ToolbarItem(placement: .primaryAction) {
@@ -194,7 +197,7 @@ public struct ContentView: View {
             }
 
             PreviewCanvas(url: url, isConnected: viewModel.isConnected,
-                          liveViewImage: viewModel.liveViewImage,
+                          feed: viewModel.liveViewFeed,
                           isLiveViewOn: viewModel.isLiveViewOn)
                 .overlay(alignment: .top) { mainViewerControl }
 
@@ -329,8 +332,8 @@ private struct PreviewCanvas: View {
     let url: URL?
     let isConnected: Bool
     /// When live view is on this takes over the canvas: composing needs the *current* framing, not
-    /// the last shot. Nil while waiting for the first frame.
-    var liveViewImage: NSImage? = nil
+    /// the last shot. Observed here and nowhere else, so an arriving frame redraws only this view.
+    @ObservedObject var feed: LiveViewFeed
     var isLiveViewOn: Bool = false
 
     var body: some View {
@@ -355,7 +358,7 @@ private struct PreviewCanvas: View {
 
     @ViewBuilder
     private var liveView: some View {
-        if let liveViewImage {
+        if let liveViewImage = feed.image {
             Image(nsImage: liveViewImage)
                 .resizable()
                 .aspectRatio(contentMode: .fit)

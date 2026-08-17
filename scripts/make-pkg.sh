@@ -17,6 +17,21 @@ if [ ! -d "$APP" ]; then
   echo "==> $APP not found, building it first…"
   ./scripts/build-app.sh
 fi
+
+# Rebuild if the existing bundle isn't the version we're about to name the installer after.
+# Otherwise bumping version.sh and packaging produces e.g. CanonTether-1.2-Installer.pkg whose
+# payload still reports 1.1 — and since UpdateChecker compares the GitHub tag against that plist
+# value, every user of that build is told to update to a version they already have, forever.
+BUILT_VERSION="$(defaults read "$ROOT/$APP/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo "")"
+if [ "$BUILT_VERSION" != "$VERSION" ]; then
+  echo "==> $APP is version ${BUILT_VERSION:-unknown}, need $VERSION — rebuilding…"
+  ./scripts/build-app.sh
+  BUILT_VERSION="$(defaults read "$ROOT/$APP/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo "")"
+  [ "$BUILT_VERSION" = "$VERSION" ] || { echo "error: built app reports '$BUILT_VERSION', expected '$VERSION'"; exit 1; }
+fi
+
+# Clean up staging even if packaging fails, so a failed run doesn't leave a full app copy behind.
+trap 'rm -rf "$ROOT/$STAGING"' EXIT
 [ -x "$APP/Contents/Frameworks/gphoto2/bin/gphoto2" ] \
   || { echo "error: app is missing the bundled gphoto2 — rebuild with build-app.sh"; exit 1; }
 

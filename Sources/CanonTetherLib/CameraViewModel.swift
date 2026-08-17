@@ -16,8 +16,13 @@ final class CameraViewModel: ObservableObject {
     /// Every reviewable capture in the download folder, oldest first — the session gallery the
     /// client review window browses. Seeded from disk at launch, appended to as new shots arrive.
     @Published private(set) var captures: [URL] = []
-    /// The current live-view frame, or nil when live view is off (or hasn't produced a frame yet).
-    @Published private(set) var liveViewImage: NSImage?
+    /// Frames live on their own observable object, deliberately *not* on this one. Publishing them
+    /// here invalidated every view that observes the view model — the toolbar, inspector,
+    /// filmstrip and the client review window — eight times a second, which re-ran the
+    /// filmstrip's "good shots only" filter over the whole session on every frame. Only the
+    /// preview canvas observes the feed, so only the preview canvas redraws.
+    let liveViewFeed = LiveViewFeed()
+    /// Whether live view is running. Changes rarely, so it stays here where the toolbar can see it.
     @Published private(set) var isLiveViewOn = false
 
     /// False if the gphoto2 CLI isn't installed — the UI shows setup instructions instead of
@@ -65,6 +70,17 @@ final class CameraViewModel: ObservableObject {
         }
         // Live view frames arrive as JPEG data and are decoded off the main actor — decoding every
         // frame on the main thread would stutter the whole UI at streaming rates.
+        // The session is the single writer of live-view state, mirroring how connectionStream owns
+        // isConnected. Without this, live view stopping itself (the camera stops supplying frames)
+        // left the UI lit up over a frozen frame with no way back except guessing, and pinned the
+        // settings poll to its exposure-only fast path for the rest of the session.
+        Task { [weak self] in
+            guard let self else { return }
+            for await active in self.session.liveViewActiveStream() where !active {
+                self.isLiveViewOn = false
+                self.liveViewFeed.clear()
+            }
+        }
         Task { [weak self] in
             guard let self else { return }
             for await data in self.session.liveViewStream() {
@@ -82,7 +98,7 @@ final class CameraViewModel: ObservableObject {
                     return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
                 }.value
                 guard self.isLiveViewOn else { continue }
-                self.liveViewImage = image
+                self.liveViewFeed.update(image)
             }
         }
         // Periodically re-read the camera's settings so the inspector tracks changes made on the
@@ -105,11 +121,13 @@ final class CameraViewModel: ObservableObject {
         // While composing, read only the exposure triangle: polling every property at this rate
         // would cost live view frames for values that don't change mid-shot.
         let paths = isLiveViewOn ? GPhotoSession.exposurePaths : nil
+        let generation = settingsGeneration
         guard let latest = try? await session.fetchSettings(paths: paths), !latest.isEmpty else { return }
-        // Re-check after the await: a user-initiated change can start (and finish) while the fetch
-        // was in flight, and applying the stale snapshot would snap the just-changed value back in
-        // the inspector until the next poll.
-        guard !isBusy else { return }
+        // A generation counter, not an `isBusy` re-check: a user's change can both start *and
+        // finish* inside this fetch, leaving isBusy false again by the time we resume, and the
+        // stale snapshot would then overwrite the value they just set — the exact bug the old
+        // re-check was meant to prevent.
+        guard settingsGeneration == generation else { return }
         // A partial read patches the settings it covers and leaves the rest alone; a full read
         // replaces outright. Equatable guards avoid churning the inspector (and closing an open
         // menu) when nothing actually changed.
@@ -132,6 +150,9 @@ final class CameraViewModel: ObservableObject {
     /// against what's on screen, relaxed otherwise.
     private static let liveSettingsPoll: UInt64 = 1_200_000_000
     private static let idleSettingsPoll: UInt64 = 4_000_000_000
+    /// Bumped whenever the photographer changes a setting, so an in-flight poll that started
+    /// before the change discards its now-stale snapshot instead of publishing it.
+    private var settingsGeneration: UInt64 = 0
 
     private func handleNewCapture(_ url: URL) {
         // A frame downloaded just before a project switch can arrive after the gallery was
@@ -287,11 +308,19 @@ final class CameraViewModel: ObservableObject {
     private func setLiveView(_ on: Bool) {
         guard on != isLiveViewOn else { return }
         isLiveViewOn = on
-        if !on { liveViewImage = nil }
-        Task { [session] in
+        if !on { liveViewFeed.clear() }
+        // Chained onto the previous toggle rather than spawned independently: two unstructured
+        // tasks have no ordering guarantee, so a quick off-then-on could arrive as on-then-off,
+        // leaving the frame loop running forever with the button showing "off" and no way to
+        // stop it.
+        let previous = liveViewToggleTask
+        liveViewToggleTask = Task { [session] in
+            _ = await previous?.result
             if on { await session.startLiveView() } else { await session.stopLiveView() }
         }
     }
+
+    private var liveViewToggleTask: Task<Void, Never>?
 
     func capture() {
         // Ignore shutter presses while the link is down — Space has no disabled state to
@@ -301,8 +330,16 @@ final class CameraViewModel: ObservableObject {
         // whatever review mode is set (in Latest, that means the shot just taken appears the
         // moment it lands). Also hands the camera back to the capture, rather than having it
         // stream preview frames through the exposure.
-        if isLiveViewOn { setLiveView(false) }
+        let wasLive = isLiveViewOn
+        if wasLive {
+            isLiveViewOn = false
+            liveViewFeed.clear()
+        }
         run {
+            // Stopped *before* the shutter command in the same task, not fired off separately:
+            // two independent tasks have no ordering guarantee, so the capture could otherwise
+            // reach the camera while the preview loop was still pulling frames.
+            if wasLive { await self.session.stopLiveView() }
             // Fire the shutter; the downloaded frame arrives asynchronously via the capture stream
             // (handleNewCapture), the same path camera-shutter shots take.
             try await self.session.capture()
@@ -325,6 +362,7 @@ final class CameraViewModel: ObservableObject {
             if let updated = try await self.session.updateSetting(setting.path, to: value),
                let index = self.settings.firstIndex(where: { $0.id == updated.id }) {
                 self.settings[index] = updated
+                self.settingsGeneration &+= 1
                 self.statusText = "\(updated.label): \(updated.current)"
             }
         }

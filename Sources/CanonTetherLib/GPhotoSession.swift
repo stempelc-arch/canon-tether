@@ -59,8 +59,19 @@ actor GPhotoSession {
     /// the Homebrew paths below.
     nonisolated private static let bundledRoot: URL? = {
         let root = Bundle.main.bundleURL.appendingPathComponent("Contents/Frameworks/gphoto2")
-        return FileManager.default.isExecutableFile(atPath: root.appendingPathComponent("bin/gphoto2").path)
-            ? root : nil
+        guard FileManager.default.isExecutableFile(atPath: root.appendingPathComponent("bin/gphoto2").path) else {
+            return nil
+        }
+        // The plugin directories must be present too, not just the binary. `environment(forBinary:)`
+        // sets CAMLIBS/IOLIBS, which *override* libgphoto2's compiled-in defaults — so a bundle
+        // missing its drivers would use the bundled binary, find no camera drivers, and never fall
+        // back to a working Homebrew install, leaving the app stuck on "Waiting for camera…".
+        for directory in ["camlibs", "iolibs"] {
+            let contents = try? FileManager.default.contentsOfDirectory(
+                atPath: root.appendingPathComponent(directory).path)
+            guard contents?.contains(where: { $0.hasSuffix(".so") }) == true else { return nil }
+        }
+        return root
     }()
 
     private static let candidatePaths = [
@@ -841,7 +852,12 @@ actor GPhotoSession {
                 markConnected(false)
                 throw GPhotoError.commandFailed("Camera session closed unexpectedly:\n\(snapshot)")
             }
-            try Task.checkCancellation()
+            // Deliberately NOT cancellable here. The command is already written to the shell, so
+            // bailing out mid-flight abandons the camera's reply, which then lands in the *next*
+            // command's buffer: a stale "Saving file as capture_preview.jpg" gets imported as a
+            // real capture, and a stale prompt satisfies the next command's done-marker early,
+            // leaving the shell permanently one response out of phase. The deadline below bounds
+            // this loop anyway, and the live view loop checks for cancellation between ticks.
             try? await Task.sleep(nanoseconds: Self.pollInterval)
         }
         // A timeout likely means the session is desynced (e.g. the camera's pairing was reset
@@ -855,6 +871,9 @@ actor GPhotoSession {
     // MARK: - Public API
 
     func connect() async throws {
+        // Nothing else sweeps at startup, so a frame stranded by a crash or force-quit mid-stream
+        // would otherwise sit in the capture folder indefinitely.
+        cleanUpPreviewFiles()
         try await ensureConnected()
         startTetherWatch()
     }
@@ -866,6 +885,10 @@ actor GPhotoSession {
     /// changes where *future* shots land, and the caller reloads the gallery from the new folder.
     func setCaptureDirectory(_ url: URL) {
         guard url != captureDirectory else { return }
+        // Sweep the outgoing folder first: once `captureDirectory` moves, any preview frame left
+        // in the old project is unreachable — later sweeps only look at the new folder, and an
+        // in-flight tick's cleanup would target the wrong directory entirely.
+        cleanUpPreviewFiles()
         captureDirectory = url
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         if process != nil { closeShell() }
@@ -929,6 +952,17 @@ actor GPhotoSession {
     /// stable, sortable, collision-free name and notifies listeners via `captureStream`.
     @discardableResult
     private func importDownloaded(_ downloadedName: String) -> URL? {
+        // A live-view frame must never enter the gallery. This is reachable on an ordinary path:
+        // pressing the shutter during live view cancels a `capture-preview` mid-flight, so the
+        // camera's "Saving file as capture_preview.jpg" reply lands in the *next* command's
+        // buffer, and the tether watch would then import a low-resolution preview as if it were
+        // the shot — in front of a client. Deleted rather than merely skipped, since the cancelled
+        // tick's own cleanup never ran.
+        guard !downloadedName.hasPrefix(Self.previewFilenamePrefix) else {
+            log("ignoring stray live-view frame \(downloadedName)")
+            try? FileManager.default.removeItem(at: captureDirectory.appendingPathComponent(downloadedName))
+            return nil
+        }
         let downloadedURL = captureDirectory.appendingPathComponent(downloadedName)
         guard FileManager.default.fileExists(atPath: downloadedURL.path) else { return nil }
         let stamp = DateFormatter.captureFilenameFormatter.string(from: Date())
@@ -987,8 +1021,28 @@ actor GPhotoSession {
     /// Begins pulling preview frames. Deliberately leaves the tether watch running: frames and
     /// camera-shutter downloads interleave over the one shell (the command lock serializes them),
     /// which costs frame rate but means a shot fired while composing is still captured.
+    /// Emits false when live view stops of its own accord (the camera stopped supplying frames),
+    /// so the UI doesn't sit showing a frozen frame under a lit "live" button — and so the
+    /// settings poll drops back to its idle cadence.
+    nonisolated func liveViewActiveStream() -> AsyncStream<Bool> {
+        AsyncStream { continuation in
+            Task { await self.setLiveViewActiveContinuation(continuation) }
+        }
+    }
+
+    private func setLiveViewActiveContinuation(_ continuation: AsyncStream<Bool>.Continuation) {
+        liveViewActiveContinuation = continuation
+    }
+
+    private var liveViewActiveContinuation: AsyncStream<Bool>.Continuation?
+
     func startLiveView() {
         guard liveViewTask == nil else { return }
+        // Reset both counters: without this the error count survives an auto-stop, so the next
+        // start dies on its first imperfect frame and live view is effectively unusable for the
+        // rest of the session.
+        liveViewErrors = 0
+        disconnectedTicks = 0
         log("live view: starting")
         liveViewTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -1015,18 +1069,37 @@ actor GPhotoSession {
     }
 
     func stopLiveView() {
-        guard liveViewTask != nil else { return }
-        liveViewTask?.cancel()
+        guard let task = liveViewTask else { return }
+        task.cancel()
         liveViewTask = nil
+        liveViewPauseDepth = 0
         log("live view: stopped")
-        cleanUpPreviewFiles()
+        liveViewActiveContinuation?.yield(false)
+        // Sweep *after* the cancelled tick has finished. Cancelling doesn't stop a frame already
+        // in flight, so sweeping immediately runs before gphoto2 writes the file and leaves one
+        // behind on every stop — which the shutter does on every shot taken from live view.
+        Task { [weak self] in
+            _ = await task.value
+            await self?.cleanUpPreviewFiles()
+        }
     }
 
     /// Pulls one preview frame. Returns false if nothing was delivered, so the caller can back off
     /// instead of spinning against a camera that isn't producing frames.
     private func liveViewTick() async -> Bool {
-        guard !liveViewPaused else { return false }
-        guard isConnected, let process, process.isRunning else { return false }
+        guard liveViewPauseDepth == 0 else { return false }
+        guard isConnected, let process, process.isRunning else {
+            // Don't spin at 2 Hz forever against a camera that's gone: give a reconnect a fair
+            // window, then stop and say so rather than leaving a dead feed lit up.
+            disconnectedTicks += 1
+            if disconnectedTicks >= Self.liveViewDisconnectLimit {
+                log("live view: stopping — camera link down")
+                status("Live view stopped — camera disconnected")
+                stopLiveView()
+            }
+            return false
+        }
+        disconnectedTicks = 0
         let started = Date()
         do {
             let output = try await sendCommand(
@@ -1070,16 +1143,27 @@ actor GPhotoSession {
             liveViewContinuation?.yield(data)
             return true
         } catch {
+            // gphoto2 may already have written the frame before the command failed (a timeout,
+            // or the link dropping mid-frame), and the delete below only gets installed once a
+            // filename is parsed — so sweep, or every such failure strands a file.
             log("live view: frame failed (\(error.localizedDescription))")
+            cleanUpPreviewFiles()
             return false
         }
     }
 
     private var liveViewFrameCount = 0
     private var liveViewErrors = 0
-    /// Halts the frame loop without tearing live view down, so a camera command gets the shell to
-    /// itself for a moment.
-    private var liveViewPaused = false
+    private var disconnectedTicks = 0
+    /// Consecutive ticks with the link down before live view gives up (~15s at the 500ms
+    /// disconnected retry).
+    private static let liveViewDisconnectLimit = 30
+    /// Nesting depth of `withLiveViewPaused`. A counter rather than a flag: overlapping pauses are
+    /// reachable (the busy watchdog releases the UI gate without cancelling the work behind it, so
+    /// a second settings change can start while the first is still applying), and with a plain
+    /// Bool the inner one's cleanup would resume the frame loop while the outer command was still
+    /// in flight — reinstating the very interference the pause exists to prevent.
+    private var liveViewPauseDepth = 0
 
     /// Runs `operation` with the live view frame loop held off. A body streaming preview frames
     /// doesn't reliably apply exposure changes sent in the gaps between them — the command goes
@@ -1087,8 +1171,8 @@ actor GPhotoSession {
     /// a frame every 125ms. The feed resumes by itself afterwards.
     private func withLiveViewPaused<T>(_ operation: () async throws -> T) async rethrows -> T {
         guard liveViewTask != nil else { return try await operation() }
-        liveViewPaused = true
-        defer { liveViewPaused = false }
+        liveViewPauseDepth += 1
+        defer { liveViewPauseDepth = max(0, liveViewPauseDepth - 1) }
         return try await operation()
     }
     private var loggedEmptyPreview = false
@@ -1332,21 +1416,35 @@ extension FileHandle {
     /// (hit 50MB in one week of dev use).
     private static let logRotateBytes: UInt64 = 5_000_000
 
+    /// Serialises every write. Writers reach this from the session actor, the main actor, and
+    /// background watchdog tasks; each used to open its own handle and do a non-atomic
+    /// seek-then-write, so interleaved writers landed at the same offset and destroyed each
+    /// other's lines — in the one file used to diagnose connection problems, precisely when it is
+    /// busiest. The same lock makes the size check and rotation atomic: two writers could
+    /// otherwise both decide to rotate, and the second would delete the log the first had just
+    /// rotated, taking the whole history with it.
+    private static let logQueue = DispatchQueue(label: "com.canontether.log")
+
     static func appendLog(_ message: String) {
         let line = "[\(DateFormatter.logFormatter.string(from: Date()))] \(message)\n"
         guard let data = line.data(using: .utf8) else { return }
-        try? FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if let handle = try? FileHandle(forWritingTo: logURL) {
-            let size = handle.seekToEndOfFile()
-            handle.write(data)
-            try? handle.close()
-            if size > logRotateBytes {
-                let old = logURL.deletingPathExtension().appendingPathExtension("old.log")
-                try? FileManager.default.removeItem(at: old)
-                try? FileManager.default.moveItem(at: logURL, to: old)
+        logQueue.async {
+            let directory = logURL.deletingLastPathComponent()
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: logURL.path) {
+                FileManager.default.createFile(atPath: logURL.path, contents: nil)
             }
-        } else {
-            try? data.write(to: logURL)
+            guard let handle = try? FileHandle(forWritingTo: logURL) else { return }
+            // The throwing variants, deliberately: `seekToEndOfFile()`/`write(_:)` raise an
+            // ObjC exception on a full disk or I/O error, which Swift cannot catch — logging a
+            // line would terminate the app mid-shoot.
+            let size = (try? handle.seekToEnd()) ?? 0
+            try? handle.write(contentsOf: data)
+            try? handle.close()
+            guard size > logRotateBytes else { return }
+            let old = logURL.deletingPathExtension().appendingPathExtension("old.log")
+            try? FileManager.default.removeItem(at: old)
+            try? FileManager.default.moveItem(at: logURL, to: old)
         }
     }
 }
