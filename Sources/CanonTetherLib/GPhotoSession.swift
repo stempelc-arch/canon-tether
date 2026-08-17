@@ -61,6 +61,9 @@ actor GPhotoSession {
     }
     private static let cameraWaitInterval: UInt64 = 1_000_000_000
     private static let connectRetryAttempts = 60
+    /// Consecutive reachability-probe refusals before assuming the camera is re-pairing and
+    /// dropping back to fresh-pairing (probe-free) connect behavior.
+    private static let probeFailureLimit = 5
     private static let connectRetryDelay: UInt64 = 1_000_000_000
     // Kept tight: this is the granularity at which every shell command's completion is noticed,
     // including capture and download, so it's pure added latency on top of the camera's own work.
@@ -536,6 +539,7 @@ actor GPhotoSession {
             if var ip = networkCameraIP() {
                 log("found camera at \(ip), connecting...")
                 status("Connecting to camera…")
+                var probeFailures = 0
                 for attempt in 1...Self.connectRetryAttempts {
                     // Only probe-then-disconnect once this session has proven the camera is already
                     // paired (see hasEverConnected's doc comment) — during a fresh pairing this
@@ -545,12 +549,23 @@ actor GPhotoSession {
                             // A dead/stale address: don't sink the full ~100s readyTimeout into a
                             // gphoto2 handshake attempt that will never get an answer. Re-resolve ARP
                             // and try again promptly instead.
+                            probeFailures += 1
+                            if probeFailures >= Self.probeFailureLimit {
+                                // A camera that keeps refusing 15740 at an address ARP still vouches
+                                // for is almost certainly re-pairing, not merely stale — and the
+                                // probes themselves disrupt that negotiation. Drop back to
+                                // fresh-pairing behavior: no more probes, real patient attempts only.
+                                log("probe refused \(probeFailures)x — assuming camera is re-pairing, switching to patient connect attempts")
+                                hasEverConnected = false
+                                continue
+                            }
                             log("ptpip:\(ip) not answering — re-checking for a fresher address")
                             guard let freshIP = networkCameraIP() else { break }
                             ip = freshIP
                             try? await Task.sleep(nanoseconds: Self.connectRetryDelay)
                             continue
                         }
+                        probeFailures = 0
                     }
                     log("attempt \(attempt)/\(Self.connectRetryAttempts): connecting to ptpip:\(ip)")
                     if await openShell(port: "ptpip:\(ip)") {
