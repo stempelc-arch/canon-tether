@@ -143,6 +143,20 @@ follows the file, reloads per-folder); one drives the real `CameraViewModel`+`Re
 A→empty B→A, checking the gallery clears and repopulates with flags. When comparing URLs in these,
 resolve symlinks — `contentsOfDirectory` returns `/private/var` while seeds are `/var`.
 
+## NEVER probe port 15740 during pairing (2026-08-17)
+The 1DX II **aborts its own wired-LAN pairing negotiation** if anything TCP-connects and
+immediately closes on port 15740 mid-announce (ssdp:byebye → 3x mDNS probe → ssdp:alive, ~5-8s):
+it `igmp leave`s both multicast groups and never becomes connectable, staying on "pairing in
+progress" forever. This caused days of failed pairing that survived firmware 1.1.8 *and* a full
+factory reset — the app's own `isReachable()` fast-reconnect probe was re-triggering the abort on
+every retry. A real client that stays connected (gphoto2's `openShell`) is fine even mid-announce.
+The guard lives in `GPhotoSession.swift`: `hasEverConnected` disables the probe until the session
+has paired once, and 5 consecutive probe refusals clear it again (a camera refusing 15740 at an
+ARP-vouched address is re-pairing). Do not "optimize" reconnects by adding any probe/healthcheck
+that opens-then-closes 15740 without this gating. Also: a rebuilt binary does nothing until the app
+process is actually quit and relaunched — compare `ps -o lstart` against the binary's mtime before
+concluding a fix failed.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).
