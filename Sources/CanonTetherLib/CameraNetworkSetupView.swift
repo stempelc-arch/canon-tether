@@ -43,8 +43,6 @@ struct CameraNetworkSetupView: View {
                 Button("Check Again") { interfaces = NetworkInterfaceScanner.linkLocalInterfaces() }
             }
 
-            Spacer()
-
             HStack {
                 Spacer()
                 Button("Done") { dismiss() }
@@ -52,7 +50,10 @@ struct CameraNetworkSetupView: View {
             }
         }
         .padding(24)
-        .frame(width: 420, height: interfaces.isEmpty ? 260 : 340)
+        // Width fixed, height intrinsic: a hard-coded height shorter than the content crops the
+        // title off the top and the Done button off the bottom (seen live at 340pt).
+        .frame(width: 440)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private func settingRow(_ label: String, _ value: String) -> some View {
