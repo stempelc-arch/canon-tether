@@ -484,10 +484,12 @@ actor GPhotoSession {
                 return true
             }
             if snapshot.contains("Connection refused") || snapshot.contains("Timeout") || snapshot.contains("ERROR") {
+                logConnectFailure("error reported", snapshot)
                 closeShell()
                 return false
             }
             if !proc.isRunning {
+                logConnectFailure("gphoto2 exited", snapshot)
                 closeShell()
                 return false
             }
@@ -497,9 +499,27 @@ actor GPhotoSession {
             }
             try? await Task.sleep(nanoseconds: Self.pollInterval)
         }
+        logConnectFailure("no response within \(Int(Self.readyTimeout))s", buffer.snapshot())
         closeShell()
         return false
     }
+
+    /// Records *why* a connection attempt failed. Without this a failed connect is a black box —
+    /// the shell's own output was previously read for markers and then thrown away, so the log
+    /// showed an endless list of attempts with no indication whether the camera refused, answered
+    /// with an error, or accepted and went quiet. Rate-limited so a long retry run can't flood the
+    /// file; the first few carry the full text, which is where the diagnosis lives.
+    private func logConnectFailure(_ reason: String, _ snapshot: String) {
+        connectFailureLogCount += 1
+        if connectFailureLogCount <= Self.verboseConnectFailures {
+            log("connect failed (\(reason)): \(snapshot.suffix(400).debugDescription)")
+        } else if connectFailureLogCount % 20 == 0 {
+            log("connect failed (\(reason)) — \(connectFailureLogCount) failures so far")
+        }
+    }
+
+    private var connectFailureLogCount = 0
+    private static let verboseConnectFailures = 5
 
     private static let captureTargetPath = "/main/settings/capturetarget"
     // Names vary by body/firmware; match loosely rather than pin one exact string.
