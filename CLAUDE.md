@@ -157,6 +157,29 @@ that opens-then-closes 15740 without this gating. Also: a rebuilt binary does no
 process is actually quit and relaunched — compare `ps -o lstart` against the binary's mtime before
 concluding a fix failed.
 
+## Bonjour discovery: investigated and rejected (2026-08-17)
+The camera **does** advertise `_ptp._tcp` (instance name `ICPO-WFTEOSSystemService<serial>`, the
+same Canon service seen in the July UPnP investigation) — `dns-sd -B _ptp._tcp local.` finds it
+immediately. But **resolving that service to an address always fails**: `NetServiceBrowser` reports
+`didFind` and then `didNotResolve` with `NSNetServicesTimeoutError` (-72007) after an 8s timeout,
+and `dns-sd -L` returns nothing either. The body announces its PTR record but won't answer the
+follow-up SRV/A queries, so mDNS can tell you a camera exists and never tell you where it is.
+Discovery therefore stays on the ARP table (`arp -an`, see `networkCameraIP`). Don't rebuild a
+Bonjour path expecting faster discovery; the announcement is real but useless for addressing.
+
+## Live view (2026-08-17)
+`capture-preview` over the persistent shell, looped: each frame lands as a JPEG in the shell's cwd
+(the capture folder, since the interactive shell ignores `--filename`), is read, **deleted
+immediately**, and yielded as `Data` on `liveViewStream()`. Deleting matters twice over — a preview
+is not a capture and must never reach the gallery, and leaving the file there makes the next frame
+hit gphoto2's overwrite prompt. Stranded frames (crash mid-stream) are swept on stop and filtered
+out of `loadExistingCaptures` by the `capture_preview` prefix.
+
+The tether watch keeps running during live view on purpose: frames and camera-shutter downloads
+interleave over the one shell via the command lock, which costs frame rate but means a shot fired
+while composing is still captured. Frames are decoded off the main actor (`Task.detached`) — at
+streaming rates, decoding on the main thread stutters the whole UI.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).

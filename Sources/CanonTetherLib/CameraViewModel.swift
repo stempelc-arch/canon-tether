@@ -16,6 +16,9 @@ final class CameraViewModel: ObservableObject {
     /// Every reviewable capture in the download folder, oldest first — the session gallery the
     /// client review window browses. Seeded from disk at launch, appended to as new shots arrive.
     @Published private(set) var captures: [URL] = []
+    /// The current live-view frame, or nil when live view is off (or hasn't produced a frame yet).
+    @Published private(set) var liveViewImage: NSImage?
+    @Published private(set) var isLiveViewOn = false
 
     /// False if the gphoto2 CLI isn't installed — the UI shows setup instructions instead of
     /// silently sitting on "waiting for camera".
@@ -58,6 +61,16 @@ final class CameraViewModel: ObservableObject {
             guard let self else { return }
             for await connected in self.session.connectionStream() {
                 self.isConnected = connected
+            }
+        }
+        // Live view frames arrive as JPEG data and are decoded off the main actor — decoding every
+        // frame on the main thread would stutter the whole UI at streaming rates.
+        Task { [weak self] in
+            guard let self else { return }
+            for await data in self.session.liveViewStream() {
+                let image = await Task.detached { NSImage(data: data) }.value
+                guard self.isLiveViewOn else { continue }
+                self.liveViewImage = image
             }
         }
         // Periodically re-read the camera's settings so the inspector tracks changes made on the
@@ -167,7 +180,11 @@ final class CameraViewModel: ObservableObject {
             options: [.skipsHiddenFiles]
         ) else { return }
 
-        let images = urls.filter { CaptureLocation.imageExtensions.contains($0.pathExtension.lowercased()) }
+        let images = urls.filter {
+            CaptureLocation.imageExtensions.contains($0.pathExtension.lowercased())
+                // A live-view frame stranded by a crash is not a shot; never list it as one.
+                && !$0.lastPathComponent.hasPrefix(GPhotoSession.previewFilenamePrefix)
+        }
         // Fetch each date once before sorting — stat-ing inside the comparator did O(n log n)
         // syscalls (10,000+ for a 1,000-file folder) on the main actor, a visible beachball on
         // every launch and project switch.
@@ -221,6 +238,18 @@ final class CameraViewModel: ObservableObject {
         // against the new folder within ~1s, so no reconnect choreography is needed here.
         Task {
             await self.session.setCaptureDirectory(url)
+        }
+    }
+
+    /// Starts/stops the camera's live view feed. Not routed through `run`: live view is a
+    /// long-running stream rather than a one-shot operation, and gating it behind `isBusy` would
+    /// let a capture in flight swallow the toggle.
+    func toggleLiveView() {
+        isLiveViewOn.toggle()
+        let on = isLiveViewOn
+        if !on { liveViewImage = nil }
+        Task { [session] in
+            if on { await session.startLiveView() } else { await session.stopLiveView() }
         }
     }
 

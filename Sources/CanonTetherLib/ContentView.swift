@@ -10,6 +10,7 @@ public struct ContentView: View {
     @State private var keyMonitor: Any?
     @StateObject private var reviewWindow = ReviewWindowController()
     @StateObject private var sleepPreventer = SleepPreventer()
+    @StateObject private var updateChecker = UpdateChecker()
     @State private var showingPreferences = false
     /// When on, the filmstrip hides shots with Soft/Borderline focus or Over/Under exposure, showing
     /// only the good ones — a fast triage pass so the photographer's picks come from shots worth
@@ -62,8 +63,10 @@ public struct ContentView: View {
         .toolbar { presenterToolbar }
         .sheet(isPresented: $showingPreferences) {
             PreferencesView(viewModel: viewModel, reviewModel: reviewModel, analysis: analysis,
+                            updateChecker: updateChecker,
                             captureCount: viewModel.captures.count)
         }
+        .task { await updateChecker.checkInBackground() }
     }
 
     @ToolbarContentBuilder
@@ -108,6 +111,20 @@ public struct ContentView: View {
                   : "Filter the filmstrip to sharp, well-exposed shots, to flag picks faster")
         }
 
+        ToolbarItem {
+            Button {
+                viewModel.toggleLiveView()
+            } label: {
+                Label("Live View", systemImage: viewModel.isLiveViewOn ? "video.fill" : "video")
+                    .foregroundStyle(viewModel.isLiveViewOn ? Color.green : Color.primary)
+            }
+            .help(viewModel.isLiveViewOn
+                  ? "Live view is on — click to go back to reviewing shots (⌘L)"
+                  : "Show the camera's live view for composing (⌘L)")
+            .keyboardShortcut("l", modifiers: .command)
+            .disabled(!viewModel.isConnected)
+        }
+
         ToolbarItem(placement: .primaryAction) {
             Button {
                 reviewWindow.toggle(viewModel: viewModel, reviewModel: reviewModel)
@@ -128,6 +145,23 @@ public struct ContentView: View {
             .help(sleepPreventer.isPreventingSleep
                   ? "Preventing sleep — click to allow the Mac to sleep again"
                   : "Keep the Mac awake during the session")
+        }
+
+        // Only shows something when there's actually an update — an always-visible update control
+        // would be clutter in a shooting UI. The conditional lives inside the item rather than
+        // around it because ToolbarContentBuilder only gained `if` support in macOS 13.
+        ToolbarItem {
+            Group {
+                if let releaseURL = updateChecker.releaseURL, let version = updateChecker.availableVersion {
+                    Button {
+                        NSWorkspace.shared.open(releaseURL)
+                    } label: {
+                        Label("Update Available", systemImage: "arrow.down.circle.fill")
+                            .foregroundStyle(Color.accentColor)
+                    }
+                    .help("Version \(version) is available — click to open the download page")
+                }
+            }
         }
 
         ToolbarItem {
@@ -162,7 +196,9 @@ public struct ContentView: View {
                 ReconnectBanner(status: viewModel.statusText)
             }
 
-            PreviewCanvas(url: url, isConnected: viewModel.isConnected)
+            PreviewCanvas(url: url, isConnected: viewModel.isConnected,
+                          liveViewImage: viewModel.liveViewImage,
+                          isLiveViewOn: viewModel.isLiveViewOn)
                 .overlay(alignment: .top) { mainViewerControl }
 
             Divider()
@@ -295,6 +331,10 @@ private struct SteamWisp: View {
 private struct PreviewCanvas: View {
     let url: URL?
     let isConnected: Bool
+    /// When live view is on this takes over the canvas: composing needs the *current* framing, not
+    /// the last shot. Nil while waiting for the first frame.
+    var liveViewImage: NSImage? = nil
+    var isLiveViewOn: Bool = false
 
     var body: some View {
         ZStack {
@@ -305,13 +345,43 @@ private struct PreviewCanvas: View {
             )
             .ignoresSafeArea()
 
-            if let url {
+            if isLiveViewOn {
+                liveView
+            } else if let url {
                 ZoomableImageView(url: url)
             } else {
                 emptyState
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder
+    private var liveView: some View {
+        if let liveViewImage {
+            Image(nsImage: liveViewImage)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                // No .animation and no .id here on purpose: frames replace each other many times a
+                // second, and any transition would smear the feed rather than update it.
+                .overlay(alignment: .topLeading) { liveBadge }
+        } else {
+            VStack(spacing: 14) {
+                ProgressView()
+                Text("Starting live view…")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var liveBadge: some View {
+        Label("LIVE", systemImage: "dot.radiowaves.left.and.right")
+            .font(.caption.weight(.bold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 9).padding(.vertical, 5)
+            .background(Color.red.opacity(0.85), in: Capsule())
+            .padding(14)
     }
 
     private var emptyState: some View {
@@ -1010,12 +1080,14 @@ private struct PreferencesView: View {
     @ObservedObject var viewModel: CameraViewModel
     @ObservedObject var reviewModel: ReviewModel
     @ObservedObject var analysis: ShotAnalysisStore
+    @ObservedObject var updateChecker: UpdateChecker
     let captureCount: Int
     @Environment(\.dismiss) private var dismiss
     @State private var captureFolder = CaptureLocation.directory
     // Keys mirror ShotAnalysisStore's key constants (string literals so they can key @AppStorage).
     @AppStorage("focusCheckEnabled") private var focusEnabled = true
     @AppStorage("exposureCheckEnabled") private var exposureEnabled = true
+    @AppStorage("checkForUpdates") private var updatesEnabled = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -1081,19 +1153,53 @@ private struct PreferencesView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            Spacer(minLength: 0)
+            // Grouped so the VStack stays within SwiftUI's ten-child builder limit.
+            Group {
+                Divider()
 
-            HStack {
-                Text("\(captureCount) photo\(captureCount == 1 ? "" : "s") in this session")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                Spacer()
-                Button("Done") { dismiss() }
-                    .keyboardShortcut(.defaultAction)
+                // Updates
+                VStack(alignment: .leading, spacing: 8) {
+                    Toggle(isOn: $updatesEnabled) {
+                        Text("Check for Updates").font(.headline)
+                    }
+                    HStack(spacing: 8) {
+                        Text(updateStatusText)
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if let url = updateChecker.releaseURL {
+                            Button("Download…") { NSWorkspace.shared.open(url) }
+                        } else {
+                            Button("Check Now") { Task { await updateChecker.check(userInitiated: true) } }
+                                .disabled(updateChecker.isChecking)
+                        }
+                    }
+                }
+
+                Spacer(minLength: 0)
+
+                HStack {
+                    Text("\(captureCount) photo\(captureCount == 1 ? "" : "s") in this session")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                    Spacer()
+                    Button("Done") { dismiss() }
+                        .keyboardShortcut(.defaultAction)
+                }
             }
         }
         .padding(24)
-        .frame(width: 520, height: 580)
+        .frame(width: 520)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var updateStatusText: String {
+        if updateChecker.isChecking { return "Checking…" }
+        if let available = updateChecker.availableVersion {
+            return "Version \(available) is available — you have \(UpdateChecker.currentVersion)."
+        }
+        if updateChecker.lastCheckFailed { return "Couldn't reach the update server." }
+        return "You're on version \(UpdateChecker.currentVersion), the latest."
     }
 
     private func chooseFolder() {

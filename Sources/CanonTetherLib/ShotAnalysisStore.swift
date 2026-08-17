@@ -123,9 +123,46 @@ final class ShotAnalysisStore: ObservableObject {
         }
     }
 
+    // MARK: - Batched publishing
+    //
+    // Results are staged here and published in windows rather than one photo at a time. Every
+    // publish of these dictionaries re-runs the filmstrip's "good shots only" filter across the
+    // whole capture list and re-diffs its ForEach, so publishing per photo made a bulk scan of a
+    // 1,000-shot folder O(n²) main-thread work — the filmstrip visibly churned for the duration.
+    // A flush window well under human reaction time costs nothing perceptible.
+
+    private var pendingFocus: [URL: FocusResult] = [:]
+    private var pendingExposure: [URL: ExposureResult] = [:]
+    private var flushTask: Task<Void, Never>?
+    private static let flushInterval: UInt64 = 250_000_000
+
+    /// Current verdicts including results staged but not yet published, so an in-flight batch
+    /// doesn't make `performAnalysis` redo work it has already done.
+    private func knownFocus(_ url: URL) -> FocusResult? { focus[url] ?? pendingFocus[url] }
+    private func knownExposure(_ url: URL) -> ExposureResult? { exposure[url] ?? pendingExposure[url] }
+
+    private func stage(focus newFocus: FocusResult?, exposure newExposure: ExposureResult?, for url: URL) {
+        if let newFocus { pendingFocus[url] = newFocus }
+        if let newExposure { pendingExposure[url] = newExposure }
+        guard flushTask == nil else { return }
+        flushTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.flushInterval)
+            self?.flushPending()
+        }
+    }
+
+    private func flushPending() {
+        flushTask = nil
+        guard !pendingFocus.isEmpty || !pendingExposure.isEmpty else { return }
+        focus.merge(pendingFocus) { _, new in new }
+        exposure.merge(pendingExposure) { _, new in new }
+        pendingFocus.removeAll()
+        pendingExposure.removeAll()
+    }
+
     private func performAnalysis(_ url: URL, force: Bool) async {
-        let wantFocus = Self.focusEnabled && (force || focus[url] == nil)
-        let wantExposure = Self.exposureEnabled && (force || exposure[url] == nil)
+        let wantFocus = Self.focusEnabled && (force || knownFocus(url) == nil)
+        let wantExposure = Self.exposureEnabled && (force || knownExposure(url) == nil)
         guard wantFocus || wantExposure else { return }
 
         let focusSharp = Self.focusThreshold, focusSoft = Self.focusSoftThreshold
@@ -135,14 +172,17 @@ final class ShotAnalysisStore: ObservableObject {
         // Serve from cache where we can, and only decode if something still needs pixels.
         var needFocus = wantFocus, needExposure = wantExposure
         if needFocus, !force, let cached = Self.readFocusScore(url) {
-            focus[url] = FocusResult(cachedScore: cached, sharpThreshold: focusSharp, softThreshold: focusSoft)
+            stage(focus: FocusResult(cachedScore: cached, sharpThreshold: focusSharp, softThreshold: focusSoft),
+                  exposure: nil, for: url)
             needFocus = false
         }
         if needExposure, !force, let cached = Self.readExposure(url) {
-            exposure[url] = ExposureResult(cachedHighlightClip: cached.0, shadowClip: cached.1,
+            stage(focus: nil,
+                  exposure: ExposureResult(cachedHighlightClip: cached.0, shadowClip: cached.1,
                                            nearWhite: cached.2, median: cached.3,
                                            highlightClipLimit: highlightLimit,
-                                           shadowClipLimit: shadowLimit, nearWhiteLimit: nearWhiteLimit)
+                                           shadowClipLimit: shadowLimit, nearWhiteLimit: nearWhiteLimit),
+                  for: url)
             needExposure = false
         }
         guard needFocus || needExposure else { return }
@@ -152,16 +192,13 @@ final class ShotAnalysisStore: ObservableObject {
         var focusResult: FocusResult?
         var exposureResult: ExposureResult?
         if needFocus {
-            let r = FocusAnalyzer.evaluate(frame, sharpThreshold: focusSharp, softThreshold: focusSoft)
-            focus[url] = r
-            focusResult = r
+            focusResult = FocusAnalyzer.evaluate(frame, sharpThreshold: focusSharp, softThreshold: focusSoft)
         }
         if needExposure {
-            let r = ExposureAnalyzer.evaluate(frame, highlightClipLimit: highlightLimit,
-                                               shadowClipLimit: shadowLimit, nearWhiteLimit: nearWhiteLimit)
-            exposure[url] = r
-            exposureResult = r
+            exposureResult = ExposureAnalyzer.evaluate(frame, highlightClipLimit: highlightLimit,
+                                                       shadowClipLimit: shadowLimit, nearWhiteLimit: nearWhiteLimit)
         }
+        stage(focus: focusResult, exposure: exposureResult, for: url)
         await Self.persist(focus: focusResult, exposure: exposureResult, to: url)
     }
 
@@ -169,6 +206,10 @@ final class ShotAnalysisStore: ObservableObject {
     /// `ReviewModel.resetForNewProject`. Tags/xattrs stay on the files, so revisiting the folder
     /// reloads them from cache.
     func resetForNewProject() {
+        flushTask?.cancel()
+        flushTask = nil
+        pendingFocus.removeAll()
+        pendingExposure.removeAll()
         focus = [:]
         exposure = [:]
     }

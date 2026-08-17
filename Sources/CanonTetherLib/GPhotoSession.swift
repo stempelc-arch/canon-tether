@@ -88,15 +88,14 @@ actor GPhotoSession {
     /// Consecutive reachability-probe refusals before assuming the camera is re-pairing and
     /// dropping back to fresh-pairing (probe-free) connect behavior.
     private static let probeFailureLimit = 5
+    /// Seconds of no camera on the link before the status line stops saying "waiting" and starts
+    /// suggesting what to check.
+    private static let waitingHintDelay = 30
     private static let connectRetryDelay: UInt64 = 1_000_000_000
     // Kept tight: this is the granularity at which every shell command's completion is noticed,
     // including capture and download, so it's pure added latency on top of the camera's own work.
     private static let pollInterval: UInt64 = 20_000_000
     private static let readyTimeout: TimeInterval = 100 // covers the ~90s on-camera confirmation window
-    // Measured live: the camera drops its PTP/IP connection after ~90s of inactivity
-    // ("read PTPIPHeader: Connection reset by peer"). Ping well under that.
-    private static let keepAliveCheckInterval: UInt64 = 5_000_000_000
-    private static let keepAliveThreshold: TimeInterval = 25
 
     // Distinct from SleepPreventer's user-facing toggle (which keeps the whole Mac awake): this
     // exempts just this process's own timers from App Nap for the app's lifetime, regardless of
@@ -115,8 +114,6 @@ actor GPhotoSession {
     private let buffer = OutputBuffer()
     private var isConnected = false
     private var progressContinuation: AsyncStream<String>.Continuation?
-    private var lastActivityAt = Date()
-    private var keepAliveTask: Task<Void, Never>?
     private var captureDirectory = CaptureLocation.directory
     private var captureContinuation: AsyncStream<URL>.Continuation?
     private var tetherTask: Task<Void, Never>?
@@ -266,11 +263,24 @@ actor GPhotoSession {
         pattern: #"\((\d{1,3}(?:\.\d{1,3}){3})\) at ([0-9a-f:]+) on \w+"#,
         options: .caseInsensitive)
 
+    /// Where the camera is. ARP-only by design — see `networkCameraIP`'s note on why the camera's
+    /// own Bonjour advertisement can't be used for this.
+    private func cameraIP() async -> String? {
+        networkCameraIP()
+    }
+
     /// The camera's current IP, from the ARP table. Uses `arp -an` (numeric) rather than `arp -a`:
     /// the latter does reverse-DNS on every entry and takes ~15s here, which was starving the whole
     /// discovery/reconnect loop; the numeric form returns in milliseconds. Since numeric output
     /// drops the "cwc…" hostname, the camera is identified by its Canon MAC OUI, with a link-local
     /// (169.254.x) peer as the fallback (EOS Utility wired-LAN self-assigns one).
+    ///
+    /// Bonjour is deliberately *not* used here, despite the camera advertising `_ptp._tcp` (as
+    /// `ICPO-WFTEOSSystemService<serial>`) — tested 2026-08-17 against the live camera: browsing
+    /// finds the service fine, but **resolving it to an address always times out**
+    /// (`NSNetServicesTimeoutError`, and `dns-sd -L` gets nothing either). The body announces its
+    /// PTR record but won't answer the follow-up SRV/A queries, so mDNS can report that a camera
+    /// exists and never say where. Don't rebuild this expecting a faster discovery path.
     private func networkCameraIP() -> String? {
         guard let arpOutput = try? runOneShot("/usr/sbin/arp", ["-an"]) else { return nil }
         let pattern = Self.arpEntryPattern
@@ -412,13 +422,6 @@ actor GPhotoSession {
             let snapshot = buffer.snapshot()
             if snapshot.contains("Manufacturer:") {
                 buffer.clear()
-                markActivity()
-                // Keep-alive disabled for now — evidence suggests it may be *causing*
-                // the camera to drop the session rather than preventing it (connection
-                // survived a full 90s idle in a manual test with zero traffic, but died
-                // within one keep-alive cycle in both app-driven tests). Needs more
-                // investigation before re-enabling.
-                // startKeepAlive()
                 await optimizeCaptureTarget()
                 return true
             }
@@ -479,8 +482,6 @@ actor GPhotoSession {
     }
 
     private func closeShell() {
-        keepAliveTask?.cancel()
-        keepAliveTask = nil
         if let stdinHandle {
             // Only ask the shell to exit if it's still alive — writing "exit" to a shell that
             // already died (e.g. after the camera reset the link) hits a readerless pipe. SIGPIPE
@@ -503,29 +504,13 @@ actor GPhotoSession {
         markConnected(false)
     }
 
-    private func markActivity() {
-        lastActivityAt = Date()
-    }
 
-    /// The camera drops its PTP/IP connection after ~90s of inactivity, so while connected but
-    /// otherwise idle (no real command in flight), periodically send a harmless `summary` to
-    /// reset its idle timer.
-    private func startKeepAlive() {
-        keepAliveTask?.cancel()
-        keepAliveTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: Self.keepAliveCheckInterval)
-                guard let self, !Task.isCancelled else { return }
-                await self.keepAliveTick()
-            }
-        }
-    }
-
-    private func keepAliveTick() async {
-        guard isConnected, Date().timeIntervalSince(lastActivityAt) > Self.keepAliveThreshold else { return }
-        log("keep-alive ping")
-        _ = try? await sendCommand("summary", doneMarkers: ["Manufacturer:", "ERROR", "*** Error"], timeout: 15)
-    }
+    // A dedicated keep-alive ping used to live here, disabled behind a note suspecting it *caused*
+    // the drops it was meant to prevent (the link survived a 90s idle with zero traffic in a manual
+    // test, but died within one keep-alive cycle in both app-driven tests). It's gone rather than
+    // left commented out: `startTetherWatch` polls `wait-event-and-download` continuously the whole
+    // time the session is up, so the link never sees anything close to the camera's ~90s idle
+    // timeout anyway. There is no idle state left for a keep-alive to protect.
 
     /// Standard PTP/IP port, per gphoto2's `ptpip:` driver default.
     private static let ptpipPort: UInt16 = 15740
@@ -605,9 +590,10 @@ actor GPhotoSession {
         let binary = try binaryPath()
         var waited = 0
         while true {
-            // Network is the primary path here, and `networkCameraIP()` (an ARP lookup) is fast, so
-            // check it every second — a camera that reappears after a reset is grabbed promptly.
-            if var ip = networkCameraIP() {
+            // Network is the primary path here, and `cameraIP()` (a Bonjour cache read, falling
+            // back to ARP) is fast, so check it every second — a camera that reappears after a
+            // reset is grabbed promptly.
+            if var ip = await cameraIP() {
                 log("found camera at \(ip), connecting...")
                 status("Connecting to camera…")
                 var probeFailures = 0
@@ -627,11 +613,16 @@ actor GPhotoSession {
                                 // probes themselves disrupt that negotiation. Drop back to
                                 // fresh-pairing behavior: no more probes, real patient attempts only.
                                 log("probe refused \(probeFailures)x — assuming camera is re-pairing, switching to patient connect attempts")
+                                // Tell the photographer, not just the log: pairing can only be
+                                // completed from the camera's own screen (Canon's design), so an app
+                                // that silently says "Connecting…" here leaves them watching a
+                                // spinner for a step only they can take.
+                                status("Camera is re-pairing — press “Start pairing devices” on the camera")
                                 hasEverConnected = false
                                 continue
                             }
                             log("ptpip:\(ip) not answering — re-checking for a fresher address")
-                            guard let freshIP = networkCameraIP() else { break }
+                            guard let freshIP = await cameraIP() else { break }
                             ip = freshIP
                             try? await Task.sleep(nanoseconds: Self.connectRetryDelay)
                             continue
@@ -649,7 +640,7 @@ actor GPhotoSession {
                     // it just hangs until openShell's own ~100s readyTimeout gives up. Re-resolve ARP
                     // before the next attempt so a fresh IP is picked up immediately instead of
                     // burning that same ~100s timeout again against an address that will never answer.
-                    guard let freshIP = networkCameraIP() else { break }
+                    guard let freshIP = await cameraIP() else { break }
                     if freshIP != ip {
                         log("camera moved to \(freshIP) mid-retry — reconnecting there instead")
                         ip = freshIP
@@ -667,7 +658,14 @@ actor GPhotoSession {
                     return
                 }
                 // The pill only needs the state; the running second count stays in the log.
-                if waited == 0 { status("Waiting for camera…") }
+                // After a while, say *what to check* rather than repeating "waiting" forever — a
+                // camera that never appears is nearly always powered off, on the wrong connection
+                // profile, or on a dead cable, and none of that is visible from in here.
+                if waited == 0 {
+                    status("Waiting for camera…")
+                } else if waited == Self.waitingHintDelay {
+                    status("Waiting for camera — check it's powered on and set to the wired-LAN profile")
+                }
                 if waited % 5 == 0 {
                     log("waiting for camera to appear (\(waited)s)...")
                 }
@@ -691,7 +689,6 @@ actor GPhotoSession {
             throw GPhotoError.noCameraDetected
         }
         buffer.clear()
-        markActivity()
         if !quiet { log("sending: \(command)") }
         try? stdinHandle.write(contentsOf: (command + "\n").data(using: .utf8)!)
 
@@ -837,6 +834,111 @@ actor GPhotoSession {
         log("downloaded \(finalURL.lastPathComponent)")
         captureContinuation?.yield(finalURL)
         return finalURL
+    }
+
+    // MARK: - Live view
+
+    /// Filenames gphoto2 gives preview frames. They land in the shell's cwd (the capture folder)
+    /// because the interactive shell ignores `--filename`, so they're deleted the moment they're
+    /// read — and filtered out of the gallery listing besides, in case a crash strands one.
+    static let previewFilenamePrefix = "capture_preview"
+
+    private var liveViewContinuation: AsyncStream<Data>.Continuation?
+    private var liveViewTask: Task<Void, Never>?
+
+    /// JPEG frames from the camera's live view, as fast as the link round-trips them. Empty while
+    /// live view is off.
+    nonisolated func liveViewStream() -> AsyncStream<Data> {
+        AsyncStream { continuation in
+            Task { await self.setLiveViewContinuation(continuation) }
+        }
+    }
+
+    private func setLiveViewContinuation(_ continuation: AsyncStream<Data>.Continuation) {
+        liveViewContinuation = continuation
+    }
+
+    /// Begins pulling preview frames. Deliberately leaves the tether watch running: frames and
+    /// camera-shutter downloads interleave over the one shell (the command lock serializes them),
+    /// which costs frame rate but means a shot fired while composing is still captured.
+    func startLiveView() {
+        guard liveViewTask == nil else { return }
+        log("live view: starting")
+        liveViewTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let delivered = await self.liveViewTick()
+                // Back off only on failure; on success go straight round again so frame rate is
+                // bounded by the camera, not by an artificial delay.
+                if !delivered {
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
+            }
+        }
+    }
+
+    func stopLiveView() {
+        guard liveViewTask != nil else { return }
+        liveViewTask?.cancel()
+        liveViewTask = nil
+        log("live view: stopped")
+        cleanUpPreviewFiles()
+    }
+
+    /// Pulls one preview frame. Returns false if nothing was delivered, so the caller can back off
+    /// instead of spinning against a camera that isn't producing frames.
+    private func liveViewTick() async -> Bool {
+        guard isConnected, let process, process.isRunning else { return false }
+        let started = Date()
+        do {
+            let output = try await sendCommand(
+                "capture-preview",
+                doneMarkers: ["gphoto2:", "*** Error", "ERROR"],
+                timeout: 10,
+                quiet: true
+            )
+            guard let name = CaptureOutput.savedFilenames(in: output).last else {
+                // No frame. Log the raw response the first time so an unexpected output shape (a
+                // different "saved as" wording, or the body refusing live view in its current
+                // mode) is diagnosable from the log rather than silently showing nothing.
+                if !loggedEmptyPreview {
+                    loggedEmptyPreview = true
+                    log("live view: no frame parsed from response: \(output.debugDescription)")
+                }
+                if output.contains("Error") || output.contains("ERROR") {
+                    status("Live view unavailable in the camera's current mode")
+                }
+                return false
+            }
+            let url = captureDirectory.appendingPathComponent(name)
+            // Always remove it: a preview frame is not a capture, and leaving it in the capture
+            // folder both pollutes the gallery and makes the next frame hit an overwrite prompt.
+            defer { try? FileManager.default.removeItem(at: url) }
+            guard let data = try? Data(contentsOf: url), !data.isEmpty else { return false }
+            liveViewFrameCount += 1
+            // One line per second of streaming, not per frame — enough to measure the rate the
+            // link actually sustains without flooding the log.
+            if liveViewFrameCount % 30 == 0 {
+                log("live view: \(liveViewFrameCount) frames, last took \(Int(Date().timeIntervalSince(started) * 1000))ms")
+            }
+            liveViewContinuation?.yield(data)
+            return true
+        } catch {
+            log("live view: frame failed (\(error.localizedDescription))")
+            return false
+        }
+    }
+
+    private var liveViewFrameCount = 0
+    private var loggedEmptyPreview = false
+
+    /// Sweeps any preview frames stranded in the capture folder (a crash mid-stream), so they can't
+    /// turn up in the gallery as if they were shots.
+    private func cleanUpPreviewFiles() {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: captureDirectory.path) else { return }
+        for name in names where name.hasPrefix(Self.previewFilenamePrefix) {
+            try? FileManager.default.removeItem(at: captureDirectory.appendingPathComponent(name))
+        }
     }
 
     /// The camera properties the settings panel exposes, in display order. gphoto2 reports the
