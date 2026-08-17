@@ -143,6 +143,28 @@ actor GPhotoSession {
     /// just make the duration small instead.
     private static let tetherWaitWindow = "50ms"
 
+    /// The relaxed listening window, used once shooting goes quiet.
+    ///
+    /// The short window above interrogates the camera about twelve times a second, and *that* is
+    /// what makes the body report "busy" and lock its own dials — there is never an idle moment in
+    /// which it can accept input. A long window is not slower listening: `wait-event-and-download`
+    /// downloads a frame the instant the event arrives either way, and only the app's notification
+    /// waits for the window to close. So the cost is up to a second before a body-shutter shot
+    /// appears in the gallery, and the gain is a camera that is usable in the photographer's own
+    /// hands without them having to ask the app for permission.
+    private static let idleTetherWaitWindow = "1s"
+    /// How long after a frame arrives to keep using the short, responsive window, so bursts and
+    /// app-triggered shots stay snappy.
+    private static let activeShootingWindow: TimeInterval = 8
+
+    private var lastFrameAt = Date.distantPast
+
+    /// Short and responsive while shooting, long and unobtrusive when not.
+    private var tetherWindow: String {
+        Date().timeIntervalSince(lastFrameAt) < Self.activeShootingWindow
+            ? Self.tetherWaitWindow : Self.idleTetherWaitWindow
+    }
+
     // Serializes shell commands. Swift actors are re-entrant across `await` (and `sendCommand`
     // awaits while polling), so without this the background tether watcher and an app-shutter
     // capture could interleave their writes/reads on the one shell. Every `sendCommand` holds it.
@@ -962,12 +984,15 @@ actor GPhotoSession {
         let start = Date()
         do {
             let output = try await sendCommand(
-                "wait-event-and-download \(Self.tetherWaitWindow)",
+                "wait-event-and-download \(tetherWindow)",
                 doneMarkers: ["gphoto2:", "*** Error"],
                 timeout: 8,
                 quiet: true
             )
             let files = CaptureOutput.savedFilenames(in: output)
+            // Frames arriving means the photographer is shooting, so stay in the short, responsive
+            // window for a while; going quiet relaxes it again and hands the body back.
+            if !files.isEmpty { lastFrameAt = Date() }
             for name in files { importDownloaded(name) }
             let elapsed = Date().timeIntervalSince(start)
             // Log only when something happened or the poll ran long (so a quiet session stays quiet,
@@ -1350,6 +1375,9 @@ actor GPhotoSession {
     }
 
     private func triggerCaptureOnce() async throws {
+        // An app-triggered shot means shooting is under way: tighten the listening window so the
+        // frames around it come through promptly.
+        lastFrameAt = Date()
         for attempt in 1...3 {
             // `capture-image-and-download` is the command proven working on this body; route its
             // result through the shared import path so it lands via `captureStream` exactly like a
