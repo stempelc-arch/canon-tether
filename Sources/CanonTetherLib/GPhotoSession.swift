@@ -263,11 +263,64 @@ actor GPhotoSession {
         pattern: #"\((\d{1,3}(?:\.\d{1,3}){3})\) at ([0-9a-f:]+) on \w+"#,
         options: .caseInsensitive)
 
-    /// Where the camera is. ARP-only by design — see `networkCameraIP`'s note on why the camera's
-    /// own Bonjour advertisement can't be used for this.
+    /// Remembers where the camera answered last time, so a camera that doesn't announce itself can
+    /// still be found on the next session (see `solicitCamera`).
+    static let lastKnownIPKey = "lastKnownCameraIP"
+
+    /// Where the camera is. Reads the ARP table, and if that's empty *solicits* a reply first.
+    ///
+    /// Discovery used to be purely passive, which was a real bug: the ARP table only holds hosts
+    /// this Mac has actually exchanged packets with, so a camera that comes up without announcing
+    /// itself (no gratuitous ARP — observed live 2026-08-17, the body sat answering pings for nine
+    /// minutes while the app reported "waiting for camera") is invisible forever, and the app never
+    /// even attempts a connection. A single ICMP echo makes the kernel resolve the address, which
+    /// populates ARP and hands the normal path something to work with.
+    ///
+    /// ICMP is safe during pairing in a way a TCP probe is not: the disruption documented in
+    /// CLAUDE.md is specifically a connect-then-close on port 15740. A ping was verified live
+    /// against a mid-pairing camera — it answered, kept pairing, and connected immediately after.
     private func cameraIP() async -> String? {
-        networkCameraIP()
+        if let known = networkCameraIP() { return known }
+        solicitCamera()
+        return networkCameraIP()
     }
+
+    /// Pings candidate addresses so an unannounced camera shows up in the ARP table. Cheap and
+    /// bounded: the remembered address every time, and a few neighbours of this Mac's own
+    /// link-local address occasionally, since manual setup puts the camera right next to us.
+    private func solicitCamera() {
+        var candidates: [String] = []
+        if let remembered = UserDefaults.standard.string(forKey: Self.lastKnownIPKey) {
+            candidates.append(remembered)
+        }
+        solicitCycle += 1
+        if solicitCycle % Self.neighbourSweepEvery == 0 {
+            candidates.append(contentsOf: neighbourCandidates())
+        }
+        for ip in candidates.prefix(Self.maxSolicitsPerCycle) {
+            // -W is milliseconds to wait for a reply, -t seconds before ping gives up entirely:
+            // both tight, because this runs inside the once-a-second discovery loop.
+            _ = try? runOneShot("/sbin/ping", ["-c", "1", "-W", "300", "-t", "1", ip], timeout: 2)
+        }
+    }
+
+    /// Addresses either side of this Mac's own link-local address — where `CameraNetworkSuggestion`
+    /// tells the photographer to put the camera during manual setup, so it's where an
+    /// un-remembered camera most likely is.
+    private func neighbourCandidates() -> [String] {
+        guard let own = NetworkInterfaceScanner.linkLocalInterfaces().first?.ipAddress else { return [] }
+        let octets = own.split(separator: ".")
+        guard octets.count == 4, let last = Int(octets[3]) else { return [] }
+        let prefix = octets[0...2].joined(separator: ".")
+        return [1, -1, 2, -2]
+            .map { last + $0 }
+            .filter { (1...254).contains($0) }
+            .map { "\(prefix).\($0)" }
+    }
+
+    private var solicitCycle = 0
+    private static let neighbourSweepEvery = 5
+    private static let maxSolicitsPerCycle = 5
 
     /// The camera's current IP, from the ARP table. Uses `arp -an` (numeric) rather than `arp -a`:
     /// the latter does reverse-DNS on every entry and takes ~15s here, which was starving the whole
@@ -631,6 +684,9 @@ actor GPhotoSession {
                     }
                     log("attempt \(attempt)/\(Self.connectRetryAttempts): connecting to ptpip:\(ip)")
                     if await openShell(port: "ptpip:\(ip)") {
+                        // Remember where it answered: next session can solicit this address
+                        // directly rather than waiting for an announcement that may never come.
+                        UserDefaults.standard.set(ip, forKey: Self.lastKnownIPKey)
                         markConnected(true)
                         status("Connected")
                         return
