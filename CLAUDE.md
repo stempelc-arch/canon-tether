@@ -157,6 +157,24 @@ that opens-then-closes 15740 without this gating. Also: a rebuilt binary does no
 process is actually quit and relaunched — compare `ps -o lstart` against the binary's mtime before
 concluding a fix failed.
 
+## The camera does not always announce itself — solicit it (2026-08-17)
+**A silent camera is not a broken camera.** The body can sit fully powered, on its manual IP, and
+answering pings in 0.2 ms while sending *nothing* unsolicited — no gratuitous ARP, no announcement.
+Since `networkCameraIP()` reads the ARP table, and the ARP table only lists hosts this Mac has
+actually exchanged packets with, the app was blind to it: nine minutes of "waiting for camera"
+across three power cycles and a battery pull, with the camera reachable the whole time. One `ping`
+populated ARP and the app connected within seconds.
+
+So `cameraIP()` now *solicits* (see `solicitCamera`): pings the last address the camera answered at
+(persisted in UserDefaults) plus neighbours of this Mac's own link-local address. **ICMP is safe
+during pairing — a TCP probe is not.** The footgun below is specifically connect-then-close on
+15740; a ping was verified live against a mid-pairing camera with no disruption.
+
+Diagnostic lesson worth keeping: "link active, zero inbound packets" reads like a wedged device and
+isn't. Before concluding a network device is dead, *address* it (ping it, ARP for it) — passive
+observation cannot distinguish "absent" from "quiet". `netstat -ib` deltas and `ifconfig <if> |
+grep status` tell you about the link; only a solicited reply tells you about the device.
+
 ## Bonjour discovery: investigated and rejected (2026-08-17)
 The camera **does** advertise `_ptp._tcp` (instance name `ICPO-WFTEOSSystemService<serial>`, the
 same Canon service seen in the July UPnP investigation) — `dns-sd -B _ptp._tcp local.` finds it
