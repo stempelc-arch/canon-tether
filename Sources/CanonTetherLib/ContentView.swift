@@ -111,7 +111,9 @@ public struct ContentView: View {
                   : "Filter the filmstrip to sharp, well-exposed shots, to flag picks faster")
         }
 
-        ToolbarItem {
+        // .primaryAction so it can't end up collapsed into the toolbar's overflow chevron — this
+        // is a shooting control, and a composing aid you have to go hunting for is useless.
+        ToolbarItem(placement: .primaryAction) {
             Button {
                 viewModel.toggleLiveView()
             } label: {
@@ -147,30 +149,25 @@ public struct ContentView: View {
                   : "Keep the Mac awake during the session")
         }
 
-        // Only shows something when there's actually an update — an always-visible update control
-        // would be clutter in a shooting UI. The conditional lives inside the item rather than
-        // around it because ToolbarContentBuilder only gained `if` support in macOS 13.
-        ToolbarItem {
-            Group {
-                if let releaseURL = updateChecker.releaseURL, let version = updateChecker.availableVersion {
-                    Button {
-                        NSWorkspace.shared.open(releaseURL)
-                    } label: {
-                        Label("Update Available", systemImage: "arrow.down.circle.fill")
-                            .foregroundStyle(Color.accentColor)
-                    }
-                    .help("Version \(version) is available — click to open the download page")
-                }
-            }
-        }
-
         ToolbarItem {
             Button {
                 showingPreferences = true
             } label: {
+                // A badge rather than a toolbar item of its own: an update notice that claims a
+                // permanent slot pushes shooting controls into the overflow chevron even when
+                // there's no update to show, which is how Live View ended up hidden.
                 Label("Preferences", systemImage: "gearshape")
+                    .overlay(alignment: .topTrailing) {
+                        if updateChecker.availableVersion != nil {
+                            Circle()
+                                .fill(Color.accentColor)
+                                .frame(width: 7, height: 7)
+                                .offset(x: 3, y: -2)
+                        }
+                    }
             }
-            .help("Preferences (⌘,)")
+            .help(updateChecker.availableVersion.map { "Preferences (⌘,) — version \($0) is available" }
+                  ?? "Preferences (⌘,)")
             .keyboardShortcut(",", modifiers: .command)
         }
 
