@@ -257,8 +257,12 @@ final class CameraViewModel: ObservableObject {
     /// long-running stream rather than a one-shot operation, and gating it behind `isBusy` would
     /// let a capture in flight swallow the toggle.
     func toggleLiveView() {
-        isLiveViewOn.toggle()
-        let on = isLiveViewOn
+        setLiveView(!isLiveViewOn)
+    }
+
+    private func setLiveView(_ on: Bool) {
+        guard on != isLiveViewOn else { return }
+        isLiveViewOn = on
         if !on { liveViewImage = nil }
         Task { [session] in
             if on { await session.startLiveView() } else { await session.stopLiveView() }
@@ -269,6 +273,11 @@ final class CameraViewModel: ObservableObject {
         // Ignore shutter presses while the link is down — Space has no disabled state to
         // respect — so we don't leave the busy spinner hung waiting on a reconnect.
         guard isConnected else { return }
+        // Taking the shot ends composing: drop out of live view so the viewer goes back to
+        // whatever review mode is set (in Latest, that means the shot just taken appears the
+        // moment it lands). Also hands the camera back to the capture, rather than having it
+        // stream preview frames through the exposure.
+        if isLiveViewOn { setLiveView(false) }
         run {
             // Fire the shutter; the downloaded frame arrives asynchronously via the capture stream
             // (handleNewCapture), the same path camera-shutter shots take.

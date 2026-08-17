@@ -1025,6 +1025,7 @@ actor GPhotoSession {
     /// Pulls one preview frame. Returns false if nothing was delivered, so the caller can back off
     /// instead of spinning against a camera that isn't producing frames.
     private func liveViewTick() async -> Bool {
+        guard !liveViewPaused else { return false }
         guard isConnected, let process, process.isRunning else { return false }
         let started = Date()
         do {
@@ -1076,6 +1077,20 @@ actor GPhotoSession {
 
     private var liveViewFrameCount = 0
     private var liveViewErrors = 0
+    /// Halts the frame loop without tearing live view down, so a camera command gets the shell to
+    /// itself for a moment.
+    private var liveViewPaused = false
+
+    /// Runs `operation` with the live view frame loop held off. A body streaming preview frames
+    /// doesn't reliably apply exposure changes sent in the gaps between them — the command goes
+    /// out and nothing happens — so settings changes get a quiet shell instead of competing with
+    /// a frame every 125ms. The feed resumes by itself afterwards.
+    private func withLiveViewPaused<T>(_ operation: () async throws -> T) async rethrows -> T {
+        guard liveViewTask != nil else { return try await operation() }
+        liveViewPaused = true
+        defer { liveViewPaused = false }
+        return try await operation()
+    }
     private var loggedEmptyPreview = false
 
     /// Sweeps any preview frames stranded in the capture folder (a crash mid-stream), so they can't
@@ -1168,14 +1183,16 @@ actor GPhotoSession {
     /// Applies a new value to a single setting, then re-reads it so the caller gets the camera's
     /// authoritative post-change state (the camera may snap the value to its nearest valid step).
     func updateSetting(_ path: String, to value: String) async throws -> CameraSetting? {
-        try await withReconnect {
-            try await self.setConfigOnce(path, value)
-            let output = try await self.sendCommand(
-                "get-config \(path)",
-                doneMarkers: ["END", "*** Error", "ERROR"],
-                timeout: 15
-            )
-            return CameraSetting.parse(from: output, path: path)
+        try await withLiveViewPaused {
+            try await withReconnect {
+                try await self.setConfigOnce(path, value)
+                let output = try await self.sendCommand(
+                    "get-config \(path)",
+                    doneMarkers: ["END", "*** Error", "ERROR"],
+                    timeout: 15
+                )
+                return CameraSetting.parse(from: output, path: path)
+            }
         }
     }
 
