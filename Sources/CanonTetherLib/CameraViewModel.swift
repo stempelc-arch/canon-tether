@@ -49,22 +49,25 @@ final class CameraViewModel: ObservableObject {
     init() {
         loadExistingCaptures()
         Task { [weak self] in
-            guard let self else { return }
-            for await message in self.session.progressStream() {
+            guard let session = self?.session else { return }
+            for await message in session.progressStream() {
+                guard let self else { return }
                 self.statusText = message
             }
         }
         // Every downloaded frame — app shutter or camera shutter — arrives here.
         Task { [weak self] in
-            guard let self else { return }
-            for await url in self.session.captureStream() {
+            guard let session = self?.session else { return }
+            for await url in session.captureStream() {
+                guard let self else { return }
                 self.handleNewCapture(url)
             }
         }
         // Live connection state, so the UI reflects the frequent wired-LAN drops/reconnects.
         Task { [weak self] in
-            guard let self else { return }
-            for await connected in self.session.connectionStream() {
+            guard let session = self?.session else { return }
+            for await connected in session.connectionStream() {
+                guard let self else { return }
                 self.isConnected = connected
             }
         }
@@ -75,8 +78,9 @@ final class CameraViewModel: ObservableObject {
         // left the UI lit up over a frozen frame with no way back except guessing, and pinned the
         // settings poll to its exposure-only fast path for the rest of the session.
         Task { [weak self] in
-            guard let self else { return }
-            for await active in self.session.liveViewActiveStream() where !active {
+            guard let session = self?.session else { return }
+            for await active in session.liveViewActiveStream() where !active {
+                guard let self else { return }
                 self.isLiveViewOn = false
                 self.liveViewFeed.clear()
             }
@@ -134,14 +138,24 @@ final class CameraViewModel: ObservableObject {
         if paths == nil {
             if latest != settings { settings = latest }
         } else {
-            var merged = settings
-            for setting in latest {
-                if let index = merged.firstIndex(where: { $0.path == setting.path }) {
-                    merged[index] = setting
+            let readPaths = Set(paths ?? [])
+            let returned = Set(latest.map(\.path))
+            var merged: [CameraSetting] = []
+            for setting in settings {
+                if let fresh = latest.first(where: { $0.path == setting.path }) {
+                    merged.append(fresh)
+                } else if readPaths.contains(setting.path) && !returned.contains(setting.path) {
+                    // The camera was asked for this one and declined to report it — it isn't
+                    // exposed in the body's current mode. Drop it, as a full read would: keeping
+                    // it left the inspector offering a stale value (and a stale choice list) that
+                    // the camera would now reject.
+                    continue
                 } else {
                     merged.append(setting)
                 }
             }
+            // Anything newly reported that we weren't already showing.
+            merged.append(contentsOf: latest.filter { new in !settings.contains { $0.path == new.path } })
             if merged != settings { settings = merged }
         }
     }

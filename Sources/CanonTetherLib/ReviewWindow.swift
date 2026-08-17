@@ -33,7 +33,11 @@ enum PreviewLoader {
                     continuation.resume(returning: nil); return
                 }
                 let image = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-                cache.setObject(image, forKey: keyString as NSString, cost: cg.width * cg.height * 4)
+                // Actual decoded size, not an assumed 4 bytes per pixel: ImageIO hands back 16-bit
+                // components for some RAW thumbnails, and undercounting by 2x let the cache hold
+                // roughly double its limit before evicting anything.
+                let bytes = cg.bytesPerRow * cg.height
+                cache.setObject(image, forKey: keyString as NSString, cost: max(bytes, cg.width * cg.height * 4))
                 continuation.resume(returning: image)
             }
         }

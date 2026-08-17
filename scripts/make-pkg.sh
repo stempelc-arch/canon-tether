@@ -62,8 +62,15 @@ app connects automatically once pairing completes.</p>
 HTML
 
 echo "==> Building component package…"
+# pkgbuild defaults BundleIsRelocatable to YES, which makes the installer ask Spotlight where a
+# copy of this bundle identifier already lives and install *there* — so a user who once dragged
+# the app to their Desktop gets the update written to the Desktop while /Applications keeps the
+# old version, and --install-location is quietly ignored. Force it off.
+pkgbuild --analyze --root "$STAGING/root" "$STAGING/component.plist" >/dev/null
+/usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" "$STAGING/component.plist" >/dev/null
 pkgbuild \
   --root "$STAGING/root" \
+  --component-plist "$STAGING/component.plist" \
   --install-location /Applications \
   --identifier com.canontether.app \
   --version "$VERSION" \

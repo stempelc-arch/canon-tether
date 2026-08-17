@@ -26,6 +26,17 @@ enum ScopeSampler {
         }
     }
 
+    /// Measures an already-decoded image — the live view feed's current frame. Same float pipeline
+    /// as the file path, so a live reading and the reading taken off the resulting capture are
+    /// directly comparable rather than two different measurements.
+    static func sample(_ image: CGImage, maxPixel: Int) async -> ScopeFrame? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: frame(from: image, maxPixel: maxPixel))
+            }
+        }
+    }
+
     private static func load(_ url: URL, maxPixel: Int) -> ScopeFrame? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
@@ -34,8 +45,17 @@ enum ScopeSampler {
             kCGImageSourceCreateThumbnailWithTransform: true
         ]
         guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        return frame(from: cg, maxPixel: maxPixel)
+    }
 
-        let width = cg.width, height = cg.height
+    /// Draws `cg` into an extended-range float buffer and wraps it as a `ScopeFrame`, scaling down
+    /// to `maxPixel` on the long edge if it's larger (a live frame usually already is smaller, in
+    /// which case it's measured as-is rather than being upscaled).
+    private static func frame(from cg: CGImage, maxPixel: Int) -> ScopeFrame? {
+        let longEdge = max(cg.width, cg.height)
+        let scale = longEdge > maxPixel ? Double(maxPixel) / Double(longEdge) : 1
+        let width = max(1, Int((Double(cg.width) * scale).rounded()))
+        let height = max(1, Int((Double(cg.height) * scale).rounded()))
         guard width > 0, height > 0 else { return nil }
 
         var floats = [Float32](repeating: 0, count: width * height * 4)
@@ -130,6 +150,11 @@ struct ScopeLayout: Equatable {
 struct ScopesPanel: View {
     let url: URL?
     let layout: ScopeLayout
+    /// Held as a plain reference, deliberately *not* observed: reading the current frame inside the
+    /// render loop keeps the scopes live without this view being invalidated by every arriving
+    /// frame (which is what made the rest of the UI re-render eight times a second).
+    var liveFeed: LiveViewFeed? = nil
+    var isLive: Bool = false
 
     @AppStorage("waveformMode") private var storedMode = WaveformMode.parade.rawValue
     /// Empty = no gamut outline; otherwise a `ColorGamut.rawValue`.
@@ -162,16 +187,51 @@ struct ScopesPanel: View {
             SectionCard {
                 // Stacked: a wide waveform, the vectorscope centred below it.
                 VStack(spacing: 0) {
-                    WaveformView(image: waveform, mode: mode, hasContent: url != nil)
+                    WaveformView(image: waveform, mode: mode, hasContent: hasContent)
                         .frame(height: layout.waveformHeight)
                     Divider()
-                    VectorscopeView(image: vector, hasContent: url != nil,
+                    VectorscopeView(image: vector, hasContent: hasContent,
                                     limit: layout.vectorLimit, gamut: gamut)
                 }
             }
         }
-        .task(id: RenderKey(url: url, mode: mode, vectorRaster: layout.vectorRaster)) { await render() }
+        .task(id: RenderKey(url: url, mode: mode, vectorRaster: layout.vectorRaster, isLive: isLive)) {
+            if isLive {
+                await renderLiveLoop()
+            } else {
+                await render()
+            }
+        }
     }
+
+    private var hasContent: Bool { isLive || url != nil }
+
+    /// Keeps the scopes tracking the live view. Measuring every frame would be wasteful and
+    /// pointless — exposure doesn't change eight times a second, and the reading has to be *read*
+    /// — so this samples the most recent frame a few times a second instead. That's what makes the
+    /// scopes usable for setting exposure before the shot rather than judging it afterwards.
+    private func renderLiveLoop() async {
+        while !Task.isCancelled {
+            await renderLiveFrame()
+            try? await Task.sleep(nanoseconds: Self.liveScopeInterval)
+        }
+    }
+
+    @MainActor
+    private func renderLiveFrame() async {
+        guard let image = liveFeed?.image,
+              let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+        guard let frame = await ScopeSampler.sample(cg, maxPixel: Self.liveSampleSize) else { return }
+        guard !Task.isCancelled else { return }
+        await draw(frame)
+    }
+
+    /// ~3 readings a second: fast enough to feel live while turning a dial, cheap enough to leave
+    /// the frame loop and the camera alone.
+    private static let liveScopeInterval: UInt64 = 320_000_000
+    /// Smaller than the stills sample: a preview frame is already small, and the plot only needs
+    /// enough samples to be readable, not to resolve detail.
+    private static let liveSampleSize = 640
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -234,6 +294,7 @@ struct ScopesPanel: View {
         let url: URL?
         let mode: WaveformMode
         let vectorRaster: Int
+        let isLive: Bool
     }
 
     private func render() async {
@@ -251,7 +312,12 @@ struct ScopesPanel: View {
             return
         }
         guard !Task.isCancelled else { return }
+        await draw(frame)
+    }
 
+    /// Plots a measured frame into both scopes. Shared by the stills and live paths so the two
+    /// read identically — the same renderer, gain and colourisation either side.
+    private func draw(_ frame: ScopeFrame) async {
         let mode = self.mode
         let vectorSize = layout.vectorRaster
         let (wave, vec) = await withCheckedContinuation { (continuation: CheckedContinuation<(NSImage?, NSImage?), Never>) in

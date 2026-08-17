@@ -391,6 +391,10 @@ actor GPhotoSession {
         process.standardOutput = stdout
         process.standardError = stderr
         try process.run()
+        // Registered like the shell is: a `gphoto2 --auto-detect` wedged in a USB ioctl at quit
+        // time would otherwise be reparented to launchd still holding its claim on the camera —
+        // the same ghost-process problem the registry exists to prevent.
+        ChildProcessRegistry.shared.register(process)
         // Drain both pipes on background threads concurrently with waiting for exit —
         // reading only after waitUntilExit() deadlocks if the child writes more than the
         // pipe buffer before exiting, since it would then block on a full pipe nothing is
@@ -599,7 +603,12 @@ actor GPhotoSession {
         stdoutHandle?.readabilityHandler = nil
         try? stdoutHandle?.close()
         stdoutHandle = nil
-        process?.terminate()
+        if let dying = process {
+            dying.terminate()
+            // Reaped off-thread so the self-healing reconnect path doesn't accumulate zombies,
+            // without blocking the actor waiting for the child to die.
+            DispatchQueue.global(qos: .utility).async { dying.waitUntilExit() }
+        }
         process = nil
         stdinHandle = nil
         markConnected(false)

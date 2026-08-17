@@ -48,7 +48,8 @@ struct InspectorPanel: View {
                     .padding(.horizontal, 20)
                     .padding(.top, 10)
 
-                ScopesPanel(url: previewURL, layout: ScopeLayout(available: geometry.size))
+                ScopesPanel(url: previewURL, layout: ScopeLayout(available: geometry.size),
+                            liveFeed: viewModel.liveViewFeed, isLive: viewModel.isLiveViewOn)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
             }
