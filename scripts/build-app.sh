@@ -61,6 +61,9 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 </plist>
 PLIST
 
+echo "==> Bundling gphoto2 into the app…"
+./scripts/bundle-gphoto2.sh "$APP"
+
 # Ad-hoc sign so the app runs without the "damaged" error on modern macOS (still unsigned re:
 # Apple). This must HARD-FAIL: on Apple Silicon an app with no signature at all (not even ad-hoc)
 # is killed by the kernel on launch with no dialog — a silently-skipped codesign would ship a DMG

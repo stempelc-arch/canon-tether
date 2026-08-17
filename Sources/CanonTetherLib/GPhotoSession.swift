@@ -54,14 +54,34 @@ enum GPhotoError: LocalizedError {
 /// As an `actor`, all camera I/O is naturally serialized — no manual locking beyond the output
 /// buffer, which is still touched from the pipe's background read callback.
 actor GPhotoSession {
+    /// gphoto2 embedded in the app bundle by scripts/bundle-gphoto2.sh — the shipped configuration,
+    /// so installs need no Homebrew. Nil in development builds (`swift run`), which fall back to
+    /// the Homebrew paths below.
+    nonisolated private static let bundledRoot: URL? = {
+        let root = Bundle.main.bundleURL.appendingPathComponent("Contents/Frameworks/gphoto2")
+        return FileManager.default.isExecutableFile(atPath: root.appendingPathComponent("bin/gphoto2").path)
+            ? root : nil
+    }()
+
     private static let candidatePaths = [
+        bundledRoot?.appendingPathComponent("bin/gphoto2").path,
         "/usr/local/bin/gphoto2",   // Homebrew on Intel
         "/opt/homebrew/bin/gphoto2" // Homebrew on Apple Silicon
-    ]
+    ].compactMap { $0 }
 
-    /// Whether the gphoto2 CLI is installed — used to show a helpful setup prompt on first run.
+    /// Whether a usable gphoto2 exists (bundled or Homebrew) — gates the first-run setup prompt.
     nonisolated static var isInstalled: Bool {
         candidatePaths.contains { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    /// The bundled gphoto2 finds its dlopen()ed camera/IO driver plugins via these env vars; a
+    /// Homebrew gphoto2 needs nothing (its plugin paths are compiled in).
+    private static func environment(forBinary binary: String) -> [String: String]? {
+        guard let bundledRoot, binary.hasPrefix(bundledRoot.path) else { return nil }
+        var env = ProcessInfo.processInfo.environment
+        env["CAMLIBS"] = bundledRoot.appendingPathComponent("camlibs").path
+        env["IOLIBS"] = bundledRoot.appendingPathComponent("iolibs").path
+        return env
     }
     private static let cameraWaitInterval: UInt64 = 1_000_000_000
     private static let connectRetryAttempts = 60
@@ -277,6 +297,7 @@ actor GPhotoSession {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
         process.arguments = arguments
+        if let env = Self.environment(forBinary: executablePath) { process.environment = env }
         let stdout = Pipe()
         let stderr = Pipe()
         process.standardOutput = stdout
@@ -348,6 +369,7 @@ actor GPhotoSession {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: binary)
         proc.arguments = ["--port", port, "--shell"]
+        if let env = Self.environment(forBinary: binary) { proc.environment = env }
         // The interactive shell doesn't reliably honor --filename's full-path/pattern argument
         // the way the one-shot CLI does — downloads land as bare camera-side names (e.g.
         // capt0000.cr2) in the process's cwd, so pin that cwd to our target folder instead.

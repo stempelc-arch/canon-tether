@@ -8,10 +8,13 @@ pick flagging that travels with the files.
 
 ## Install (prebuilt)
 
-1. Download `CanonTether-<version>.dmg` from [Releases](../../releases).
-2. Install gphoto2: `brew install libgphoto2 gphoto2`
-3. Mount the DMG, drag the app to Applications.
-4. First launch: **right-click → Open** (the app is unsigned; Gatekeeper needs the explicit bypass once).
+1. Download `CanonTether-<version>-Installer.pkg` from [Releases](../../releases).
+2. Right-click the .pkg → **Open** (one-time Gatekeeper step for an unsigned installer), and follow
+   the installer.
+3. First app launch: **right-click → Open** (same one-time step).
+
+The installer is fully self-contained — the camera engine (gphoto2/libgphoto2) is embedded in the
+app, no Homebrew or Terminal needed.
 
 ## Camera setup (wired LAN)
 
@@ -23,14 +26,15 @@ automatically once the camera appears on the link.
 
 ## Build from source
 
-Requirements: macOS 12+, Xcode command line tools, Homebrew gphoto2 (runtime dependency only —
-nothing links against it; the app drives the `gphoto2` CLI).
+Requirements: macOS 12+, Xcode command line tools, and Homebrew gphoto2 on the **build** machine
+(`brew install libgphoto2 gphoto2`) — the build embeds it into the app, so installs need nothing.
 
 ```sh
 git clone https://github.com/stempelc-arch/canon-tether.git
 cd canon-tether
-./scripts/build-app.sh   # → CanonTether.app
-./scripts/make-dmg.sh    # → dist/CanonTether-<version>.dmg
+./scripts/build-app.sh   # → CanonTether.app (with gphoto2 bundled inside)
+./scripts/make-pkg.sh    # → dist/CanonTether-<version>-Installer.pkg (guided installer)
+./scripts/make-dmg.sh    # → dist/CanonTether-<version>.dmg (drag-install alternative)
 ```
 
 `swift build` / `swift run CanonTether` work for development. The app version is set in
