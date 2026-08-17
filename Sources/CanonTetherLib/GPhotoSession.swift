@@ -955,6 +955,14 @@ actor GPhotoSession {
     /// read — and filtered out of the gallery listing besides, in case a crash strands one.
     static let previewFilenamePrefix = "capture_preview"
 
+    /// Target seconds per live-view frame (~8 fps). Deliberately well below what the link can
+    /// sustain — see the pacing note in `startLiveView`.
+    private static let liveViewFrameInterval: TimeInterval = 0.125
+    /// Consecutive preview errors before live view gives up. The body reports an unspecified
+    /// error for a few frames before its session dies outright, so stopping early is the
+    /// difference between a dropped feed and a dropped camera connection.
+    private static let liveViewErrorLimit = 3
+
     private var liveViewContinuation: AsyncStream<Data>.Continuation?
     private var liveViewTask: Task<Void, Never>?
 
@@ -985,11 +993,22 @@ actor GPhotoSession {
         liveViewTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
+                let started = Date()
                 let delivered = await self.liveViewTick()
-                // Back off only on failure; on success go straight round again so frame rate is
-                // bounded by the camera, not by an artificial delay.
                 if !delivered {
                     try? await Task.sleep(nanoseconds: 500_000_000)
+                    continue
+                }
+                // Pace the feed rather than pulling flat out. Measured live, an unthrottled loop
+                // ran ~18 fps and the body gave up after ~2,500 frames: `capture-preview` started
+                // returning "Unspecified error" and the whole PTP/IP session collapsed seconds
+                // later. It also starved everything else — ordinary settings reads were waiting
+                // 3s for the shell. Composing doesn't need 18 fps, and a session that survives is
+                // worth far more than a smoother feed.
+                let elapsed = Date().timeIntervalSince(started)
+                let remaining = Self.liveViewFrameInterval - elapsed
+                if remaining > 0 {
+                    try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
                 }
             }
         }
@@ -1023,11 +1042,19 @@ actor GPhotoSession {
                     loggedEmptyPreview = true
                     log("live view: no frame parsed from response: \(output.debugDescription)")
                 }
-                if output.contains("Error") || output.contains("ERROR") {
-                    status("Live view unavailable in the camera's current mode")
+                liveViewErrors += 1
+                if liveViewErrors >= Self.liveViewErrorLimit {
+                    // Bail out rather than keep asking. Observed live: the body returns
+                    // "Unspecified error" for a few frames and then drops the entire PTP/IP
+                    // session — losing the feed is recoverable, losing the camera link means
+                    // re-pairing from the camera's own screen.
+                    log("live view: stopping after \(liveViewErrors) consecutive errors")
+                    status("Live view stopped — the camera stopped providing frames")
+                    stopLiveView()
                 }
                 return false
             }
+            liveViewErrors = 0
             let url = captureDirectory.appendingPathComponent(name)
             // Always remove it: a preview frame is not a capture, and leaving it in the capture
             // folder both pollutes the gallery and makes the next frame hit an overwrite prompt.
@@ -1048,6 +1075,7 @@ actor GPhotoSession {
     }
 
     private var liveViewFrameCount = 0
+    private var liveViewErrors = 0
     private var loggedEmptyPreview = false
 
     /// Sweeps any preview frames stranded in the capture folder (a crash mid-stream), so they can't
