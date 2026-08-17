@@ -1158,14 +1158,25 @@ actor GPhotoSession {
         )
     }
 
-    /// Reads all exposed camera settings in one pass over the open shell session.
-    func fetchSettings() async throws -> [CameraSetting] {
-        try await withReconnect { try await self.fetchSettingsOnce() }
+    /// The exposure triangle — the settings a photographer actually turns while judging a live
+    /// view, and so the ones worth re-reading often. Kept separate from the full list because
+    /// polling all five during live view costs frames for values (white balance, image format)
+    /// that essentially never change mid-composition.
+    static let exposurePaths = [
+        "/main/imgsettings/iso",
+        "/main/capturesettings/shutterspeed",
+        "/main/capturesettings/aperture"
+    ]
+
+    /// Reads camera settings over the open shell session — all of them, or just `paths`.
+    func fetchSettings(paths: [String]? = nil) async throws -> [CameraSetting] {
+        let targets = paths ?? Self.settingPaths
+        return try await withReconnect { try await self.fetchSettingsOnce(targets) }
     }
 
-    private func fetchSettingsOnce() async throws -> [CameraSetting] {
+    private func fetchSettingsOnce(_ paths: [String]) async throws -> [CameraSetting] {
         var results: [CameraSetting] = []
-        for path in Self.settingPaths {
+        for path in paths {
             let output = try await sendCommand(
                 "get-config \(path)",
                 doneMarkers: ["END", "*** Error", "ERROR"],

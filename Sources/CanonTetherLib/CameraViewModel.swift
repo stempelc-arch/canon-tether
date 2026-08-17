@@ -89,8 +89,12 @@ final class CameraViewModel: ObservableObject {
         // camera body (dials, mode switches). Skipped while a capture or in-app set is in flight.
         Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 4_000_000_000)
                 guard let self else { return }
+                // Track the body closely while composing: turning a dial on the camera should
+                // show up in the inspector (and be judged against the live view) more or less as
+                // it happens, not up to four seconds later.
+                let interval = self.isLiveViewOn ? Self.liveSettingsPoll : Self.idleSettingsPoll
+                try? await Task.sleep(nanoseconds: interval)
                 await self.refreshSettingsIfIdle()
             }
         }
@@ -98,16 +102,36 @@ final class CameraViewModel: ObservableObject {
 
     private func refreshSettingsIfIdle() async {
         guard isConnected, !isBusy else { return }
-        guard let latest = try? await session.fetchSettings(), !latest.isEmpty else { return }
+        // While composing, read only the exposure triangle: polling every property at this rate
+        // would cost live view frames for values that don't change mid-shot.
+        let paths = isLiveViewOn ? GPhotoSession.exposurePaths : nil
+        guard let latest = try? await session.fetchSettings(paths: paths), !latest.isEmpty else { return }
         // Re-check after the await: a user-initiated change can start (and finish) while the fetch
         // was in flight, and applying the stale snapshot would snap the just-changed value back in
         // the inspector until the next poll.
         guard !isBusy else { return }
-        // Equatable guard avoids churning the inspector (and closing open menus) when nothing changed.
-        if latest != settings {
-            settings = latest
+        // A partial read patches the settings it covers and leaves the rest alone; a full read
+        // replaces outright. Equatable guards avoid churning the inspector (and closing an open
+        // menu) when nothing actually changed.
+        if paths == nil {
+            if latest != settings { settings = latest }
+        } else {
+            var merged = settings
+            for setting in latest {
+                if let index = merged.firstIndex(where: { $0.path == setting.path }) {
+                    merged[index] = setting
+                } else {
+                    merged.append(setting)
+                }
+            }
+            if merged != settings { settings = merged }
         }
     }
+
+    /// Settings poll cadence: brisk while live view is up so camera-side dial changes register
+    /// against what's on screen, relaxed otherwise.
+    private static let liveSettingsPoll: UInt64 = 1_200_000_000
+    private static let idleSettingsPoll: UInt64 = 4_000_000_000
 
     private func handleNewCapture(_ url: URL) {
         // A frame downloaded just before a project switch can arrive after the gallery was
