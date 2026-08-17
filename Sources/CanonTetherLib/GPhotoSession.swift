@@ -169,8 +169,20 @@ actor GPhotoSession {
     private func markConnected(_ connected: Bool) {
         guard connected != isConnected else { return }
         isConnected = connected
+        if connected { hasEverConnected = true }
         connectedContinuation?.yield(connected)
     }
+
+    /// Set the first time this session ever completes a real connection. Gates `isReachable`'s
+    /// probe-then-disconnect: live packet capture caught it landing mid-camera's own SSDP/mDNS
+    /// pairing negotiation (byebye → 3x probe → alive, ~5-8s uninterrupted) and immediately
+    /// FIN-closing — the camera reacted by leaving both multicast groups and abandoning its own
+    /// announce sequence after just one probe instead of the normal three, every single time. A
+    /// *real* client staying connected through the protocol (what openShell does) is fine even
+    /// during that window — the July capture shows a real connection landing mid-announce-burst
+    /// with no disruption — so only skip straight to a real attempt (no throwaway probe first)
+    /// until this session has proven the camera is already paired and probing is safe.
+    private var hasEverConnected = false
 
     /// Internal diagnostics: console plus ~/Library/Logs/CanonTether.log. Deliberately never
     /// reaches the UI — gphoto2's send/recv chatter is for debugging the wired-LAN drops, not for
@@ -525,15 +537,20 @@ actor GPhotoSession {
                 log("found camera at \(ip), connecting...")
                 status("Connecting to camera…")
                 for attempt in 1...Self.connectRetryAttempts {
-                    guard await isReachable(ip) else {
-                        // A dead/stale address: don't sink the full ~100s readyTimeout into a
-                        // gphoto2 handshake attempt that will never get an answer. Re-resolve ARP
-                        // and try again promptly instead.
-                        log("ptpip:\(ip) not answering — re-checking for a fresher address")
-                        guard let freshIP = networkCameraIP() else { break }
-                        ip = freshIP
-                        try? await Task.sleep(nanoseconds: Self.connectRetryDelay)
-                        continue
+                    // Only probe-then-disconnect once this session has proven the camera is already
+                    // paired (see hasEverConnected's doc comment) — during a fresh pairing this
+                    // throwaway check disrupts the camera's own in-progress negotiation.
+                    if hasEverConnected {
+                        guard await isReachable(ip) else {
+                            // A dead/stale address: don't sink the full ~100s readyTimeout into a
+                            // gphoto2 handshake attempt that will never get an answer. Re-resolve ARP
+                            // and try again promptly instead.
+                            log("ptpip:\(ip) not answering — re-checking for a fresher address")
+                            guard let freshIP = networkCameraIP() else { break }
+                            ip = freshIP
+                            try? await Task.sleep(nanoseconds: Self.connectRetryDelay)
+                            continue
+                        }
                     }
                     log("attempt \(attempt)/\(Self.connectRetryAttempts): connecting to ptpip:\(ip)")
                     if await openShell(port: "ptpip:\(ip)") {
