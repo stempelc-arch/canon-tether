@@ -924,7 +924,34 @@ actor GPhotoSession {
         }
     }
 
+    /// While true the app sends the camera nothing at all, so the body stops reporting "busy" and
+    /// its own dials and menus become usable again. The lock isn't a Canon policy about tethering
+    /// — it's simply that this app polls `wait-event-and-download` roughly every 80ms and reads
+    /// settings on top of that, leaving the body no idle moment to accept input.
+    private var pollingPaused = false
+
+    /// Hands the camera back to the photographer. Bounded rather than indefinite: the PTP/IP link
+    /// is documented to drop after roughly 90s of silence, and a dropped link on this body costs a
+    /// re-pair from its own screen — so silence is capped well short of that and the caller is
+    /// told when it ends.
+    func pausePolling() {
+        guard !pollingPaused else { return }
+        pollingPaused = true
+        log("polling paused — camera controls handed back to the body")
+        status("Camera control — adjust settings on the body")
+    }
+
+    func resumePolling() {
+        guard pollingPaused else { return }
+        pollingPaused = false
+        log("polling resumed")
+    }
+
+    var isPollingPaused: Bool { pollingPaused }
+
     private func tetherTick() async {
+        // The whole point of the pause: no commands, so the body isn't busy.
+        guard !pollingPaused else { return }
         // If the session is down (idle reset, etc.), transparently bring it back so physical-
         // shutter capture resumes on its own. The watcher is the app's self-healing driver.
         guard isConnected, let process, process.isRunning else {
@@ -1096,7 +1123,7 @@ actor GPhotoSession {
     /// Pulls one preview frame. Returns false if nothing was delivered, so the caller can back off
     /// instead of spinning against a camera that isn't producing frames.
     private func liveViewTick() async -> Bool {
-        guard liveViewPauseDepth == 0 else { return false }
+        guard liveViewPauseDepth == 0, !pollingPaused else { return false }
         guard isConnected, let process, process.isRunning else {
             // Don't spin at 2 Hz forever against a camera that's gone: give a reconnect a fair
             // window, then stop and say so rather than leaving a dead feed lit up.

@@ -121,7 +121,9 @@ final class CameraViewModel: ObservableObject {
     }
 
     private func refreshSettingsIfIdle() async {
-        guard isConnected, !isBusy else { return }
+        // Silent during camera control: a settings read is a command like any other, and the whole
+        // point is to leave the body alone so its own controls work.
+        guard isConnected, !isBusy, !isCameraControlMode else { return }
         // While composing, read only the exposure triangle: polling every property at this rate
         // would cost live view frames for values that don't change mid-shot.
         let paths = isLiveViewOn ? GPhotoSession.exposurePaths : nil
@@ -315,6 +317,51 @@ final class CameraViewModel: ObservableObject {
     /// Starts/stops the camera's live view feed. Not routed through `run`: live view is a
     /// long-running stream rather than a one-shot operation, and gating it behind `isBusy` would
     /// let a capture in flight swallow the toggle.
+    /// Hands the camera back so its own dials and menus work. The body reports "busy" and locks
+    /// its controls whenever this app is polling it, which it otherwise does continuously.
+    @Published private(set) var isCameraControlMode = false
+
+    func toggleCameraControl() {
+        isCameraControlMode.toggle()
+        let paused = isCameraControlMode
+        if paused {
+            // Live view can't run during this — it's a command every 125ms, which is exactly what
+            // makes the body busy.
+            if isLiveViewOn { setLiveView(false) }
+            statusText = "Camera control — adjust settings on the body"
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            if paused {
+                await self.session.pausePolling()
+                // Bounded, and it says so when it ends: the PTP/IP link is documented to drop
+                // after ~90s of silence, and on this body a dropped link means re-pairing from
+                // the camera's own screen. Better to resume automatically than to lose it.
+                try? await Task.sleep(nanoseconds: Self.cameraControlWindow)
+                guard self.isCameraControlMode else { return }
+                self.isCameraControlMode = false
+                await self.session.resumePolling()
+                self.statusText = "Resumed — reading the camera's settings"
+                await self.forceSettingsRefresh()
+            } else {
+                await self.session.resumePolling()
+                await self.forceSettingsRefresh()
+            }
+        }
+    }
+
+    /// Re-reads everything after the photographer has been changing things on the body, so the
+    /// inspector reflects whatever they did rather than the values from before the pause.
+    private func forceSettingsRefresh() async {
+        guard let latest = try? await session.fetchSettings(), !latest.isEmpty else { return }
+        settingsGeneration &+= 1
+        settings = latest
+    }
+
+    /// How long the camera gets to itself before polling resumes — well short of the ~90s idle
+    /// timeout that would drop the link.
+    private static let cameraControlWindow: UInt64 = 45_000_000_000
+
     func toggleLiveView() {
         setLiveView(!isLiveViewOn)
     }
