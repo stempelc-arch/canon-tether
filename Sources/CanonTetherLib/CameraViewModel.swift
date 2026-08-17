@@ -288,7 +288,14 @@ final class CameraViewModel: ObservableObject {
     /// Applies a new value to one setting and patches the returned authoritative state back into
     /// place, leaving the other settings untouched.
     func updateSetting(_ setting: CameraSetting, to value: String) {
-        guard value != setting.current else { return }
+        // Logged end to end: a settings change had three separate ways to vanish silently (the
+        // control disabled while busy, this equality guard, and `run`'s busy gate), which made
+        // "I can't change the shutter speed" impossible to tell apart from "the camera refused".
+        FileHandle.appendLog("UI: updateSetting \(setting.path) \(setting.current) -> \(value)")
+        guard value != setting.current else {
+            FileHandle.appendLog("UI: updateSetting ignored — value already \(value)")
+            return
+        }
         run {
             self.statusText = "Setting \(setting.label)…"
             if let updated = try await self.session.updateSetting(setting.path, to: value),
@@ -303,18 +310,37 @@ final class CameraViewModel: ObservableObject {
         // A dropped action used to vanish without a trace, so a shutter press that arrived while
         // something else was in flight simply did nothing and said nothing. Surface it.
         guard !isBusy else {
+            FileHandle.appendLog("UI: action dropped — busy")
             statusText = "Camera is busy — try again in a moment"
             return
         }
         isBusy = true
         errorMessage = nil
+        let token = UUID()
+        busyToken = token
+        // Watchdog. `isBusy` disables every camera control, so a single operation that never
+        // returns — a capture starved behind another command, a reconnect waiting on a camera
+        // that's gone — used to leave the whole inspector greyed out until the app was
+        // relaunched, with no clue why. Nothing legitimate here runs this long: capture has its
+        // own 60s ceiling and settings reads 15s.
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.busyWatchdog)
+            guard let self, self.busyToken == token, self.isBusy else { return }
+            FileHandle.appendLog("UI: busy watchdog fired — releasing a stuck operation")
+            self.statusText = "That took too long — the camera may need reconnecting"
+            self.isBusy = false
+        }
         Task {
             do {
                 try await work()
             } catch {
                 errorMessage = error.localizedDescription
             }
-            isBusy = false
+            if busyToken == token { isBusy = false }
         }
     }
+
+    private var busyToken = UUID()
+    /// Longer than any legitimate operation (capture tops out at 60s, settings reads at 15s).
+    private static let busyWatchdog: UInt64 = 90_000_000_000
 }
