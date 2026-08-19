@@ -194,8 +194,18 @@ which the camera could accept input. The listening window is now **adaptive** (`
 longer window is *not* slower listening — gphoto2 downloads a frame the instant the event arrives
 either way, and only the app's notification waits for the window to close — so the cost is up to a
 second of gallery delay on an idle body-shutter shot, and the gain is a camera usable in the
-photographer's hands. `⌘B` (Camera Control) additionally stops *all* polling for 45s; bounded
-because the link drops after ~90s of silence and a dropped link costs a re-pair.
+photographer's hands. A manual "stop polling" button was built and then **removed**: needing to
+press something is not the app working as intended, and adaptive listening made it unnecessary.
+
+**Discovery must be self-healing and must log.** Observed 2026-08-19: after a dropped session the
+reconnect loop ran **19.5 hours** without once logging "found camera", and a fresh process
+connected in 10 seconds — the app appeared to need quitting and reopening to reconnect. Discovery
+logged nothing about what it solicited or what ARP held, so the cause could not be established
+after the fact. It now logs both (rate-limited), sweeps neighbouring addresses every cycle once the
+remembered address stops working (a camera back on a different self-assigned address is otherwise
+invisible forever, since this body doesn't reliably announce itself), and every ~120 failed cycles
+restores the state a relaunch would give it: `closeShell`, `hasEverConnected = false`, fresh
+solicit rhythm, cleared buffer.
 
 **Batch multi-command reads.** A settings read is five `get-config`s; with one lock acquisition
 each, every one queued behind a full tether window — the read cost ~5s and polls landed 6.3s apart,

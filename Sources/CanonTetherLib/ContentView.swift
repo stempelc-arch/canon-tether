@@ -111,20 +111,6 @@ public struct ContentView: View {
                   : "Filter the filmstrip to sharp, well-exposed shots, to flag picks faster")
         }
 
-        ToolbarItem(placement: .primaryAction) {
-            Button {
-                viewModel.toggleCameraControl()
-            } label: {
-                Label("Camera Control", systemImage: viewModel.isCameraControlMode ? "camera.fill" : "camera")
-                    .foregroundStyle(viewModel.isCameraControlMode ? Color.orange : Color.primary)
-            }
-            .help(viewModel.isCameraControlMode
-                  ? "The camera's own controls are active — click to hand it back to the app"
-                  : "Stop polling so the camera's dials and menus work again (⌘B)")
-            .keyboardShortcut("b", modifiers: .command)
-            .disabled(!viewModel.isConnected)
-        }
-
         // .primaryAction so it can't end up collapsed into the toolbar's overflow chevron — this
         // is a shooting control, and a composing aid you have to go hunting for is useless.
         ToolbarItem(placement: .primaryAction) {

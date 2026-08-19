@@ -327,7 +327,55 @@ actor GPhotoSession {
     private func cameraIP() async -> String? {
         if let known = networkCameraIP() { return known }
         solicitCamera()
-        return networkCameraIP()
+        let found = networkCameraIP()
+        // Discovery used to log nothing at all, which made a 19.5-hour fruitless wait
+        // indistinguishable from an absent camera: the log showed only "waiting for camera" with
+        // no record of what was tried or what the ARP table held. Rate-limited so a long wait
+        // stays readable.
+        discoveryLogCycle += 1
+        if found == nil {
+            discoveryFailureStreak += 1
+            if discoveryLogCycle % Self.discoveryLogEvery == 0 {
+                log("discovery: no camera for \(discoveryFailureStreak) cycles — arp=\(arpSummary()), solicited=\(lastSolicited.joined(separator: ","))")
+            }
+            // Self-heal. Quitting and reopening the app is the one thing observed to fix a wedged
+            // reconnect (a 19.5-hour fruitless wait that a fresh process resolved in 10 seconds),
+            // so rather than require that, periodically restore the state a relaunch would have:
+            // no stale shell, no assumption that probing is safe, and a fresh solicit rhythm.
+            if discoveryFailureStreak % Self.selfHealAfter == 0 {
+                log("discovery: resetting session state after \(discoveryFailureStreak) failed cycles")
+                closeShell()
+                hasEverConnected = false
+                solicitCycle = 0
+                buffer.clear()
+            }
+        } else {
+            discoveryFailureStreak = 0
+        }
+        return found
+    }
+
+    private var discoveryFailureStreak = 0
+    /// Sweep neighbours every cycle past this point — the remembered address clearly isn't it.
+    private static let desperateAfter = 30
+    /// Cycles of total failure before restoring the state a relaunch would give us.
+    private static let selfHealAfter = 120
+
+    private var discoveryLogCycle = 0
+    private var lastSolicited: [String] = []
+    /// Roughly once a minute at the ~2s loop cadence.
+    private static let discoveryLogEvery = 30
+
+    /// A compact view of what the ARP table actually holds, for the discovery log — the missing
+    /// piece when diagnosing "the app can't see a camera that is plainly there".
+    private func arpSummary() -> String {
+        guard let output = try? runOneShot("/usr/sbin/arp", ["-an"]) else { return "arp-failed" }
+        let lines = output.split(separator: "\n")
+        let complete = lines.filter { !$0.contains("incomplete") && $0.contains(" at ") }
+        let canon = complete.filter { line in
+            Self.canonOUIs.contains { line.lowercased().contains($0) }
+        }
+        return "\(lines.count) entries/\(complete.count) resolved/\(canon.count) canon"
     }
 
     /// Pings candidate addresses so an unannounced camera shows up in the ARP table. Cheap and
@@ -339,10 +387,16 @@ actor GPhotoSession {
             candidates.append(remembered)
         }
         solicitCycle += 1
-        if solicitCycle % Self.neighbourSweepEvery == 0 {
+        // Sweep the neighbourhood occasionally, and *every* cycle once the remembered address has
+        // clearly stopped working — a camera that came back on a different self-assigned address
+        // is otherwise invisible forever, because the one address we keep pinging is dead and
+        // nothing else ever populates ARP for a body that doesn't announce itself.
+        if solicitCycle % Self.neighbourSweepEvery == 0 || discoveryFailureStreak > Self.desperateAfter {
             candidates.append(contentsOf: neighbourCandidates())
         }
-        for ip in candidates.prefix(Self.maxSolicitsPerCycle) {
+        let targets = Array(candidates.prefix(Self.maxSolicitsPerCycle))
+        lastSolicited = targets.isEmpty ? ["none"] : targets
+        for ip in targets {
             // -W is milliseconds to wait for a reply, -t seconds before ping gives up entirely:
             // both tight, because this runs inside the once-a-second discovery loop.
             _ = try? runOneShot("/sbin/ping", ["-c", "1", "-W", "300", "-t", "1", ip], timeout: 2)
@@ -964,34 +1018,7 @@ actor GPhotoSession {
         }
     }
 
-    /// While true the app sends the camera nothing at all, so the body stops reporting "busy" and
-    /// its own dials and menus become usable again. The lock isn't a Canon policy about tethering
-    /// — it's simply that this app polls `wait-event-and-download` roughly every 80ms and reads
-    /// settings on top of that, leaving the body no idle moment to accept input.
-    private var pollingPaused = false
-
-    /// Hands the camera back to the photographer. Bounded rather than indefinite: the PTP/IP link
-    /// is documented to drop after roughly 90s of silence, and a dropped link on this body costs a
-    /// re-pair from its own screen — so silence is capped well short of that and the caller is
-    /// told when it ends.
-    func pausePolling() {
-        guard !pollingPaused else { return }
-        pollingPaused = true
-        log("polling paused — camera controls handed back to the body")
-        status("Camera control — adjust settings on the body")
-    }
-
-    func resumePolling() {
-        guard pollingPaused else { return }
-        pollingPaused = false
-        log("polling resumed")
-    }
-
-    var isPollingPaused: Bool { pollingPaused }
-
     private func tetherTick() async {
-        // The whole point of the pause: no commands, so the body isn't busy.
-        guard !pollingPaused else { return }
         // If the session is down (idle reset, etc.), transparently bring it back so physical-
         // shutter capture resumes on its own. The watcher is the app's self-healing driver.
         guard isConnected, let process, process.isRunning else {
@@ -1166,7 +1193,7 @@ actor GPhotoSession {
     /// Pulls one preview frame. Returns false if nothing was delivered, so the caller can back off
     /// instead of spinning against a camera that isn't producing frames.
     private func liveViewTick() async -> Bool {
-        guard liveViewPauseDepth == 0, !pollingPaused else { return false }
+        guard liveViewPauseDepth == 0 else { return false }
         guard isConnected, let process, process.isRunning else {
             // Don't spin at 2 Hz forever against a camera that's gone: give a reconnect a fair
             // window, then stop and say so rather than leaving a dead feed lit up.

@@ -37,9 +37,9 @@ limitation — so if the app says the camera is re-pairing, press "Start pairing
 body and it will connect on its own. After a short power cycle it reconnects hands-free; after the
 camera has been off for hours, expect to confirm the pairing once.
 
-If you need the camera's dials completely to yourself, **⌘B** stops the app talking to it for 45
-seconds. In normal use you shouldn't need it: the app listens gently enough that the body stays
-responsive on its own.
+The camera stays usable in your own hands while tethered — the app listens gently enough that the
+body doesn't lock its dials, so you can adjust settings on either end and each side reflects the
+other.
 
 ## Build from source
 
