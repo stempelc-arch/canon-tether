@@ -103,9 +103,17 @@ actor GPhotoSession {
     /// suggesting what to check.
     private static let waitingHintDelay = 30
     private static let connectRetryDelay: UInt64 = 1_000_000_000
-    /// Ceiling for the refusal back-off — long enough to stop hammering a camera that isn't
-    /// listening, short enough that the reconnect still feels immediate once it is.
-    private static let maxConnectRetryDelay: UInt64 = 8_000_000_000
+    /// Ceiling for the refusal back-off.
+    ///
+    /// Kept short on purpose. A *refused* connection is harmless — the camera's TCP stack answers
+    /// with a reset and no session is ever established — so it is not the accept-then-abandon
+    /// pattern that aborts pairing, and there is nothing to be gentle about. What backing off far
+    /// does cost is the pairing window: the camera only completes the handshake while an attempt
+    /// is actually in flight, so retrying every eight seconds meant mostly *not* knocking during
+    /// the moment it became ready, which read as the app hanging while the camera waited.
+    private static let maxConnectRetryDelay: UInt64 = 2_000_000_000
+    /// Refusals before telling the photographer what (if anything) they need to do.
+    private static let refusalsBeforeGuidance = 5
     // Kept tight: this is the granularity at which every shell command's completion is noticed,
     // including capture and download, so it's pure added latency on top of the camera's own work.
     private static let pollInterval: UInt64 = 20_000_000
@@ -353,6 +361,21 @@ actor GPhotoSession {
             discoveryFailureStreak = 0
         }
         return found
+    }
+
+    /// What to tell the photographer when the camera isn't accepting connections.
+    ///
+    /// This used to say "press Start pairing devices" unconditionally, which is **wrong** for the
+    /// common case and actively harmful: a camera that has paired with this Mac before only needs
+    /// to be left alone to reconnect, and starting a fresh pairing puts it into a
+    /// register-a-new-device state that the app's resume attempts can't satisfy — observed today
+    /// wedging a working setup for several minutes. Only a camera we have no record of pairing
+    /// with needs that instruction; pairing itself is camera-driven by Canon's design, so the
+    /// advice matters.
+    private func pairingGuidance() -> String {
+        UserDefaults.standard.string(forKey: Self.lastKnownIPKey) == nil
+            ? "Camera needs pairing — press “Start pairing devices” on the camera"
+            : "Reconnecting to the camera — no action needed on the camera"
     }
 
     private var discoveryFailureStreak = 0
@@ -609,7 +632,15 @@ actor GPhotoSession {
     /// showed an endless list of attempts with no indication whether the camera refused, answered
     /// with an error, or accepted and went quiet. Rate-limited so a long retry run can't flood the
     /// file; the first few carry the full text, which is where the diagnosis lives.
+    /// Set when the camera actively refused the PTP/IP port. That refusal is conclusive: the body
+    /// is up and answering at the IP level but its PTP service isn't listening, which on this
+    /// camera means it is working through its own pairing. Probing it further is both pointless
+    /// and harmful — a connect-then-abandon is precisely what aborts that negotiation (see
+    /// CLAUDE.md) — so one refusal is enough to switch to patient, probe-free attempts.
+    private var lastConnectRefused = false
+
     private func logConnectFailure(_ reason: String, _ snapshot: String) {
+        if snapshot.contains("Connection refused") { lastConnectRefused = true }
         connectFailureLogCount += 1
         if connectFailureLogCount <= Self.verboseConnectFailures {
             log("connect failed (\(reason)): \(snapshot.suffix(400).debugDescription)")
@@ -623,6 +654,8 @@ actor GPhotoSession {
     /// Any command waiting longer than this for the shell is worth recording — it means something
     /// else is monopolising the camera.
     private static let slowLockWarning: TimeInterval = 1
+    /// Characters of a camera response worth keeping in the log.
+    private static let maxLoggedResponse = 240
 
     private static let captureTargetPath = "/main/settings/capturetarget"
     // Names vary by body/firmware; match loosely rather than pin one exact string.
@@ -787,7 +820,10 @@ actor GPhotoSession {
                     // Only probe-then-disconnect once this session has proven the camera is already
                     // paired (see hasEverConnected's doc comment) — during a fresh pairing this
                     // throwaway check disrupts the camera's own in-progress negotiation.
-                    if hasEverConnected {
+                    // `lastConnectRefused`: one refusal already tells us the camera is pairing, so
+                    // don't spend five more probes discovering that — especially since each probe
+                    // risks aborting the very negotiation we're waiting on.
+                    if hasEverConnected, !lastConnectRefused {
                         guard await isReachable(ip) else {
                             // A dead/stale address: don't sink the full ~100s readyTimeout into a
                             // gphoto2 handshake attempt that will never get an answer. Re-resolve ARP
@@ -803,7 +839,7 @@ actor GPhotoSession {
                                 // completed from the camera's own screen (Canon's design), so an app
                                 // that silently says "Connecting…" here leaves them watching a
                                 // spinner for a step only they can take.
-                                status("Camera is re-pairing — press “Start pairing devices” on the camera")
+                                status(pairingGuidance())
                                 hasEverConnected = false
                                 continue
                             }
@@ -818,6 +854,7 @@ actor GPhotoSession {
                     log("attempt \(attempt)/\(Self.connectRetryAttempts): connecting to ptpip:\(ip)")
                     if await openShell(port: "ptpip:\(ip)") {
                         consecutiveRefusals = 0
+                        lastConnectRefused = false
                         // Remember where it answered: next session can solicit this address
                         // directly rather than waiting for an announcement that may never come.
                         UserDefaults.standard.set(ip, forKey: Self.lastKnownIPKey)
@@ -844,6 +881,13 @@ actor GPhotoSession {
                     // about connection churn during pairing (see CLAUDE.md). Ramp 1s → 8s and stay
                     // there, so we still catch it promptly once it does start listening.
                     consecutiveRefusals += 1
+                    // Say what's happening once it's clearly not a momentary blip. The camera is
+                    // reachable but refusing its PTP port, which means it's working through
+                    // pairing — and what the photographer should do about that depends entirely on
+                    // whether this Mac has paired with it before.
+                    if consecutiveRefusals == Self.refusalsBeforeGuidance {
+                        status(pairingGuidance())
+                    }
                     let backoff = min(Self.connectRetryDelay << min(consecutiveRefusals / 3, 3),
                                       Self.maxConnectRetryDelay)
                     try? await Task.sleep(nanoseconds: backoff)
@@ -931,7 +975,13 @@ actor GPhotoSession {
                     let delta = snapshot.hasPrefix(lastLoggedSnapshot)
                         ? String(snapshot.dropFirst(lastLoggedSnapshot.count))
                         : snapshot
-                    log("recv: \(delta.debugDescription)")
+                    // Capped: a single `get-config` reply can run to a couple of thousand
+                    // characters of choice list, and the diagnostic value is all in the first
+                    // line or two.
+                    let trimmed = delta.count > Self.maxLoggedResponse
+                        ? String(delta.prefix(Self.maxLoggedResponse)) + "…(+\(delta.count - Self.maxLoggedResponse) chars)"
+                        : delta
+                    log("recv: \(trimmed.debugDescription)")
                 }
                 lastLoggedSnapshot = snapshot
             }
@@ -1370,10 +1420,15 @@ actor GPhotoSession {
         try await withCommandLock {
             var results: [CameraSetting] = []
             for path in paths {
+                // Quiet: this runs every 1.5s and each response carries the camera's entire list of
+                // valid values. Logging it grew the file ~2.3 MB/hour, so it rotated every couple
+                // of hours and took the connect/discovery lines — the only ones that ever diagnose
+                // anything — with it. Twice today that destroyed the history mid-investigation.
                 let output = try await sendCommandLocked(
                     "get-config \(path)",
                     doneMarkers: ["END", "*** Error", "ERROR"],
-                    timeout: 15
+                    timeout: 15,
+                    quiet: true
                 )
                 // A property the camera doesn't expose in its current mode yields no `Current:`
                 // line (parse returns nil); skip it rather than failing the whole fetch.

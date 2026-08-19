@@ -135,8 +135,16 @@ the new folder within ~1s. So a live switch costs a camera reconnect; switching 
 (camera idle) is free.
 
 ## Testing gotcha
-`swift test` dies with `error: Exited with signal code 11` on this Mac — a segfault in SwiftPM's
-`swiftpm-xctest-helper`, not in the app code. To verify logic, compile the sources plus a throwaway
+`swift test` dies with `error: Exited with signal code 11` on this Mac — a segfault in the XCTest
+runner, not in the app code (confirmed 2026-08-19: `xcrun xctest` run directly against the built
+`.xctest` bundle segfaults identically, so it is the environment, not SwiftPM's wrapper).
+
+**Because of that the suite silently rotted**: by 2026-08-19 the XCTest files no longer even
+*compiled* against the current API (`ExposureAnalyzer` had gained separate highlight/shadow/
+near-white limits months earlier), and nothing surfaced it. GitHub Actions (`.github/workflows/
+ci.yml`) now builds and runs the tests on a clean runner on every push, and also rebuilds the app
+bundle and asserts the embedded gphoto2 has zero Homebrew references — the "works here, breaks on
+the user's Mac" check that no local run can make. To verify logic, compile the sources plus a throwaway
 `main.swift` directly with `swiftc` and run that. Two such harnesses proved out the project-switch
 work: one exercises the Finder-tag flag round-trip on real files (tag lands in the xattr, no sidecar,
 follows the file, reloads per-folder); one drives the real `CameraViewModel`+`ReviewModel` through

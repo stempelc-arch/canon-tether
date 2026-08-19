@@ -17,7 +17,16 @@ enum PreviewLoader {
     }()
 
     static func load(_ url: URL, maxPixel: Int) async -> NSImage? {
-        let keyString = "\(url.path)|\(maxPixel)"
+        // Size and modification date are part of the key, not just the path. Capture files don't
+        // normally change, but a project folder re-shot into, or a camera whose file counter has
+        // been reset, can reproduce a filename — and a path-only key would then serve the previous
+        // photo indefinitely, which on a client monitor means showing the wrong person's picture.
+        let stamp = (try? FileManager.default.attributesOfItem(atPath: url.path)).map { attributes in
+            let size = (attributes[.size] as? Int) ?? 0
+            let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            return "\(size)|\(Int(modified))"
+        } ?? "nostat"
+        let keyString = "\(url.path)|\(maxPixel)|\(stamp)"
         if let cached = cache.object(forKey: keyString as NSString) { return cached }
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
