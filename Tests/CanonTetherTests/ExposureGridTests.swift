@@ -84,7 +84,12 @@ final class ExposureGridTests: XCTestCase {
         XCTAssertEqual(ExposureGrid.stops(of: "1/125", path: ExposureGrid.shutterPath)!,
                        ExposureGrid.stops(of: "1/250", path: ExposureGrid.shutterPath)! - 1.0,
                        accuracy: 0.001)
-        XCTAssertEqual(ExposureGrid.stops(of: "f/2.8", path: ExposureGrid.aperturePath)!, 3.0, accuracy: 0.01)
+        // f-numbers are *marked* rounded: the true third full stop is 2√2 ≈ 2.8284, which is
+        // exactly 3.0 stops, but the camera reports "2.8" and 2·log₂(2.8) is 2.971. So the honest
+        // expectation is "within a rounding of 3 stops", not 3 stops exactly — the tolerance has
+        // to cover the marking, not just floating-point error. This is well inside the ±0.09 that
+        // `detect` allows when it measures gaps between adjacent values, so it costs nothing.
+        XCTAssertEqual(ExposureGrid.stops(of: "f/2.8", path: ExposureGrid.aperturePath)!, 3.0, accuracy: 0.05)
         XCTAssertNil(ExposureGrid.stops(of: "Auto", path: ExposureGrid.isoPath))
         XCTAssertNil(ExposureGrid.stops(of: "bulb", path: ExposureGrid.shutterPath))
     }
