@@ -1,0 +1,48 @@
+name: CI
+
+# The XCTest runner segfaults on the primary dev Mac (a SwiftPM/toolchain fault, not app code —
+# `swift test` and even `xcrun xctest` on the built bundle both die with signal 11), which is why
+# the suite had gone stale and unnoticed. Running it on a clean hosted runner is what keeps it
+# honest; locally, the convention remains a throwaway `swiftc` harness (see CLAUDE.md).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: swift --version
+
+      - name: Build
+        run: swift build -v
+
+      - name: Test
+        run: swift test
+
+  # The app bundle embeds gphoto2 and rewrites its library paths; the bundling script's own
+  # verification is what catches a bundle that would work here and fail on a user's Mac, so it is
+  # worth exercising in CI rather than only at release time.
+  package:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gphoto2 (build-time dependency only — it gets embedded)
+        run: brew install libgphoto2 gphoto2
+
+      - name: Build app bundle
+        run: ./scripts/build-app.sh
+
+      - name: Verify the bundle is self-contained
+        run: |
+          DEST="CanonTether.app/Contents/Frameworks/gphoto2"
+          LEAKS=$(find "$DEST" -type f \( -name '*.dylib' -o -name '*.so' -o -name gphoto2 \) \
+                  -exec otool -L {} \; | grep -cE '/usr/local/|/opt/homebrew/' || true)
+          echo "Homebrew references: $LEAKS"
+          test "$LEAKS" -eq 0
