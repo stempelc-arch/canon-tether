@@ -550,11 +550,13 @@ actor GPhotoSession {
             return false
         }
         do {
-            try FileManager.default.createDirectory(at: captureDirectory, withIntermediateDirectories: true)
+            // Staging is what the shell actually needs; it must exist before gphoto2 launches or
+            // the process can't start. It lives in Caches, so it's always writable — the capture
+            // folder is checked separately at import time, where a failure can be reported without
+            // costing the connection.
+            try FileManager.default.createDirectory(at: Self.stagingDirectory, withIntermediateDirectories: true)
         } catch {
-            // An unreachable capture folder (unplugged external drive) would otherwise wedge the
-            // connect loop in a silent infinite retry with the pill stuck on "Connecting…".
-            status("Capture folder unavailable — choose a new one in Preferences")
+            status("Can't create the download staging folder — check disk space")
             return false
         }
         let proc = Process()
@@ -563,8 +565,11 @@ actor GPhotoSession {
         if let env = Self.environment(forBinary: binary) { proc.environment = env }
         // The interactive shell doesn't reliably honor --filename's full-path/pattern argument
         // the way the one-shot CLI does — downloads land as bare camera-side names (e.g.
-        // capt0000.cr2) in the process's cwd, so pin that cwd to our target folder instead.
-        proc.currentDirectoryURL = captureDirectory
+        // capt0000.cr2) in the process's cwd. That cwd is fixed for the life of the process, so it
+        // points at a *staging* folder rather than the capture folder: `importDownloaded` moves
+        // each file into whichever project is current, which is what lets the photographer switch
+        // projects without the connection being torn down and re-paired.
+        proc.currentDirectoryURL = Self.stagingDirectory
 
         let stdin = Pipe()
         let stdout = Pipe()
@@ -1036,16 +1041,29 @@ actor GPhotoSession {
     /// down here; the tether watch loop then relaunches it against the new folder within a second
     /// (or the next `connect()` does, if the camera wasn't attached). No files move: this only
     /// changes where *future* shots land, and the caller reloads the gallery from the new folder.
+    /// Switches projects. **Does not touch the camera connection.**
+    ///
+    /// It used to tear the shell down, because gphoto2 downloads into its working directory and
+    /// that's fixed when the process launches. The note saying a live switch "costs a reconnect"
+    /// was written when reconnects looked cheap; they aren't — on this body one can mean pairing
+    /// again from the camera's own screen, which is not an acceptable price for choosing a folder
+    /// mid-shoot. Downloads now land in a fixed staging folder and `importDownloaded` moves each
+    /// one into whatever project is current, so switching is instant and the camera never notices.
     func setCaptureDirectory(_ url: URL) {
         guard url != captureDirectory else { return }
-        // Sweep the outgoing folder first: once `captureDirectory` moves, any preview frame left
-        // in the old project is unreachable — later sweeps only look at the new folder, and an
-        // in-flight tick's cleanup would target the wrong directory entirely.
-        cleanUpPreviewFiles()
         captureDirectory = url
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        if process != nil { closeShell() }
     }
+
+    /// Where gphoto2 is told to drop files. Fixed for the life of the process so the shell's
+    /// working directory never has to change — see `setCaptureDirectory`. Kept out of the capture
+    /// folder so a half-written download or a stray preview frame is never visible to the
+    /// photographer as if it were a shot.
+    private static let stagingDirectory: URL = {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return base.appendingPathComponent("CanonTether/incoming")
+    }()
 
     // MARK: - Tethered capture (both shutters share this download path)
 
@@ -1116,11 +1134,14 @@ actor GPhotoSession {
         // tick's own cleanup never ran.
         guard !downloadedName.hasPrefix(Self.previewFilenamePrefix) else {
             log("ignoring stray live-view frame \(downloadedName)")
-            try? FileManager.default.removeItem(at: captureDirectory.appendingPathComponent(downloadedName))
+            try? FileManager.default.removeItem(at: Self.stagingDirectory.appendingPathComponent(downloadedName))
             return nil
         }
-        let downloadedURL = captureDirectory.appendingPathComponent(downloadedName)
+        // Source is the staging folder gphoto2 downloads into; destination is whichever project is
+        // current at this instant — which is what makes switching projects free.
+        let downloadedURL = Self.stagingDirectory.appendingPathComponent(downloadedName)
         guard FileManager.default.fileExists(atPath: downloadedURL.path) else { return nil }
+        try? FileManager.default.createDirectory(at: captureDirectory, withIntermediateDirectories: true)
         let stamp = DateFormatter.captureFilenameFormatter.string(from: Date())
         var finalURL = captureDirectory.appendingPathComponent(stamp + "." + downloadedURL.pathExtension)
         // A burst can land two frames within the same one-second stamp — disambiguate.
@@ -1131,6 +1152,11 @@ actor GPhotoSession {
         do {
             try FileManager.default.moveItem(at: downloadedURL, to: finalURL)
         } catch {
+            // The shot is safe in staging — say so rather than letting it look like the frame was
+            // lost. This is where an unwritable capture folder (unplugged drive, permissions) now
+            // surfaces, since the connection no longer depends on that folder being reachable.
+            log("couldn't move \(downloadedName) into \(captureDirectory.path): \(error.localizedDescription)")
+            status("Can't write to the capture folder — the shot is held; choose another folder in Preferences")
             return nil
         }
         log("downloaded \(finalURL.lastPathComponent)")
@@ -1140,7 +1166,7 @@ actor GPhotoSession {
 
     // MARK: - Live view
 
-    /// Filenames gphoto2 gives preview frames. They land in the shell's cwd (the capture folder)
+    /// Filenames gphoto2 gives preview frames. They land in the shell's cwd (the staging folder)
     /// because the interactive shell ignores `--filename`, so they're deleted the moment they're
     /// read — and filtered out of the gallery listing besides, in case a crash strands one.
     static let previewFilenamePrefix = "capture_preview"
@@ -1285,9 +1311,10 @@ actor GPhotoSession {
                 return false
             }
             liveViewErrors = 0
-            let url = captureDirectory.appendingPathComponent(name)
-            // Always remove it: a preview frame is not a capture, and leaving it in the capture
-            // folder both pollutes the gallery and makes the next frame hit an overwrite prompt.
+            let url = Self.stagingDirectory.appendingPathComponent(name)
+            // Always remove it: a preview frame is not a capture, and leaving it behind makes the
+            // next frame hit gphoto2's overwrite prompt. Staging keeps it out of the photographer's
+            // folder in the first place.
             defer { try? FileManager.default.removeItem(at: url) }
             guard let data = try? Data(contentsOf: url), !data.isEmpty else { return false }
             liveViewFrameCount += 1
@@ -1336,9 +1363,13 @@ actor GPhotoSession {
     /// Sweeps any preview frames stranded in the capture folder (a crash mid-stream), so they can't
     /// turn up in the gallery as if they were shots.
     private func cleanUpPreviewFiles() {
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: captureDirectory.path) else { return }
-        for name in names where name.hasPrefix(Self.previewFilenamePrefix) {
-            try? FileManager.default.removeItem(at: captureDirectory.appendingPathComponent(name))
+        // Sweeps staging, where previews now land. The capture folder is swept too, for frames
+        // stranded there by a build that predates staging.
+        for directory in [Self.stagingDirectory, captureDirectory] {
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { continue }
+            for name in names where name.hasPrefix(Self.previewFilenamePrefix) {
+                try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+            }
         }
     }
 

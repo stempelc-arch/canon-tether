@@ -129,10 +129,16 @@ setResourceValue(_,forKey:.tagNamesKey)` write) — stored in the file's own
 project switch and come back on return. Don't replace this with a sidecar/JSON scheme; that xattr is
 the persistence.
 
-Gotcha: gphoto2's shell downloads into its **launch cwd**, fixed at spawn, so `setCaptureDirectory`
-tears the shell down — the self-healing tether loop (or the next `connect()`) relaunches it against
-the new folder within ~1s. So a live switch costs a camera reconnect; switching between shoots
-(camera idle) is free.
+**Switching projects no longer touches the connection (fixed 2026-09-11).** gphoto2 downloads into
+its launch cwd, fixed at spawn, so `setCaptureDirectory` used to tear the shell down and reconnect.
+That was written when a reconnect looked cheap; it isn't — on this body one can mean re-pairing from
+the camera's own screen, which is not an acceptable price for choosing a folder mid-shoot. The cwd
+is now a fixed **staging** folder (`GPhotoSession.stagingDirectory`, in Caches) and
+`importDownloaded` moves each file into whichever project is current, so a switch is a variable
+assignment. Staging also keeps half-written downloads and live-view frames out of the photographer's
+folder entirely. Consequence: the capture folder is no longer validated at connect time, so an
+unwritable folder surfaces at import instead — the shot is held in staging and the status says so,
+rather than the connection failing.
 
 ## Testing gotcha
 `swift test` dies with `error: Exited with signal code 11` on this Mac — a segfault in the XCTest
