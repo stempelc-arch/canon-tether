@@ -192,17 +192,18 @@ private struct QualityReadout: View {
         }
     }
 
-    /// e.g. "−1⅓ EV" — signed the way exposure compensation is, so it reads as the correction to
-    /// dial rather than a measurement to interpret.
+    /// e.g. "1⅓ Over" — how far the *image* is off, which is how a photographer describes an
+    /// exposure ("it's a stop over"), rather than the signed compensation needed to fix it.
     @ViewBuilder
     private func stopsReadout(_ e: ExposureResult) -> some View {
         let offset = e.offset
         if offset.stops != 0 {
-            Text("\(offset.stops > 0 ? "−" : "+")\(offset.label) EV")
+            // "≥" when clipping has destroyed the data the figure would need to be exact.
+            Text("\(offset.isAtLeast ? "≥" : "")\(offset.label) \(offset.stops > 0 ? "Over" : "Under")")
                 .font(.callout.monospacedDigit().weight(.semibold))
                 .foregroundStyle(.red)
-                .help("Dial roughly \(offset.label) \(abs(offset.stops) == 1 ? "stop" : "stops") "
-                      + "\(offset.stops > 0 ? "down" : "up") — the frame reads \(offset.summary).")
+                .help("The image is \(offset.summary) — dial roughly \(offset.label) "
+                      + "\(abs(offset.stops) == 1 ? "stop" : "stops") \(offset.stops > 0 ? "down" : "up").")
         }
     }
 }
