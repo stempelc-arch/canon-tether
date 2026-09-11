@@ -92,4 +92,61 @@ final class ExposureAnalysisTests: XCTestCase {
         let frame = ScopeFrame(width: 16, height: 16, rgba: rgba)
         _ = evaluate(frame)
     }
+
+    // MARK: - Exposure offset (stops over/under)
+
+    /// A neutral scene centred on mid-grey, then deliberately mis-exposed by `stops`.
+    private func scene(misExposedBy stops: Double, size: Int = 120) -> ScopeFrame {
+        func encode(_ linear: Double) -> Float {
+            let c = min(max(linear, 0), 1)
+            return Float(c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1 / 2.4) - 0.055)
+        }
+        var rgba = [Float](repeating: 0, count: size * size * 4)
+        for i in 0..<(size * size) {
+            let t = Double(i) / Double(size * size - 1)
+            let linear = 0.18 * pow(2.0, (t - 0.5) * 6)     // ±3 stops around mid-grey
+            let v = encode(linear * pow(2.0, stops))
+            rgba[i * 4] = v; rgba[i * 4 + 1] = v; rgba[i * 4 + 2] = v; rgba[i * 4 + 3] = 1
+        }
+        return ScopeFrame(width: size, height: size, rgba: rgba)
+    }
+
+    /// The reading has to recover a known mis-exposure, or the number on the badge is decoration.
+    func testOffsetRecoversKnownMisExposure() {
+        for applied in [-2.0, -1.0, -2.0 / 3, 0.0, 1.0 / 3, 1.0, 2.0] {
+            let measured = ExposureAnalyzer.offset(scene(misExposedBy: applied)).stops
+            XCTAssertEqual(measured, applied, accuracy: 0.34,
+                           "a \(applied)-stop error should read back as roughly that")
+        }
+    }
+
+    /// Exposure is dialled in thirds, so the reading is quantised to thirds — never 0.41 stops.
+    func testOffsetIsQuantisedToThirds() {
+        for raw in [0.05, 0.4, 0.9, 1.7] {
+            let thirds = ExposureAnalyzer.quantiseToThirds(raw) * 3
+            XCTAssertEqual(thirds, thirds.rounded(), accuracy: 1e-9)
+        }
+    }
+
+    /// More than half the frame clipped means the true brightness is past what was recorded, so
+    /// the figure must present itself as a floor rather than a measurement.
+    func testFullyClippedFrameReportsALowerBound() {
+        var white = [Float](repeating: 1, count: 32 * 32 * 4)
+        for i in 0..<(32 * 32) { white[i * 4 + 3] = 1 }
+        let over = ExposureAnalyzer.offset(ScopeFrame(width: 32, height: 32, rgba: white))
+        XCTAssertTrue(over.isAtLeast)
+        XCTAssertGreaterThan(over.stops, 0)
+        XCTAssertTrue(over.summary.hasPrefix("at least"))
+    }
+
+    /// Thirds are written the way a photographer writes them.
+    func testOffsetLabels() {
+        XCTAssertEqual(ExposureOffset(stops: 1.0 / 3, isAtLeast: false).label, "\u{2153}")
+        XCTAssertEqual(ExposureOffset(stops: 2.0 / 3, isAtLeast: false).label, "\u{2154}")
+        XCTAssertEqual(ExposureOffset(stops: 1.0, isAtLeast: false).label, "1")
+        XCTAssertEqual(ExposureOffset(stops: 4.0 / 3, isAtLeast: false).label, "1\u{2153}")
+        XCTAssertEqual(ExposureOffset(stops: 2.0, isAtLeast: false).label, "2")
+        XCTAssertEqual(ExposureOffset(stops: 1.0, isAtLeast: false).summary, "1 stop over")
+        XCTAssertEqual(ExposureOffset(stops: -2.0, isAtLeast: false).summary, "2 stops under")
+    }
 }

@@ -176,13 +176,33 @@ private struct QualityReadout: View {
             HStack(spacing: 5) {
                 if hi { Text("Highlights").foregroundStyle(.red) }
                 if lo { Text("Shadows").foregroundStyle(.red) }
+                // The actionable half of the warning: which way to go and by how much, in the
+                // thirds the exposure is actually dialled in. Omitted when the frame loses both
+                // ends, since no single exposure change fixes a scene that exceeds the range.
+                if !(hi && lo) { stopsReadout(e) }
             }
         } else {
             switch e.verdict {
             case .good: Text("OK").foregroundStyle(.green)
-            case .over: Text("Bright").foregroundStyle(.red)   // median high without hard clipping
-            case .under: Text("Dark").foregroundStyle(.red)
+            case .over:
+                HStack(spacing: 5) { Text("Bright").foregroundStyle(.red); stopsReadout(e) }
+            case .under:
+                HStack(spacing: 5) { Text("Dark").foregroundStyle(.red); stopsReadout(e) }
             }
+        }
+    }
+
+    /// e.g. "−1⅓ EV" — signed the way exposure compensation is, so it reads as the correction to
+    /// dial rather than a measurement to interpret.
+    @ViewBuilder
+    private func stopsReadout(_ e: ExposureResult) -> some View {
+        let offset = e.offset
+        if offset.stops != 0 {
+            Text("\(offset.stops > 0 ? "−" : "+")\(offset.label) EV")
+                .font(.callout.monospacedDigit().weight(.semibold))
+                .foregroundStyle(.red)
+                .help("Dial roughly \(offset.label) \(abs(offset.stops) == 1 ? "stop" : "stops") "
+                      + "\(offset.stops > 0 ? "down" : "up") — the frame reads \(offset.summary).")
         }
     }
 }

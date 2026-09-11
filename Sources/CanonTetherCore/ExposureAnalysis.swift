@@ -36,6 +36,11 @@ public struct ExposureResult: Equatable, Sendable {
     public let median: Double
     public let verdict: ExposureVerdict
 
+    /// How far off the exposure is, in thirds of a stop — derived from `median`, so a cached
+    /// result carries it without re-reading pixels. Only meaningful alongside a non-`good`
+    /// verdict; see `ExposureAnalyzer.offset`.
+    public var offset: ExposureOffset { ExposureAnalyzer.offset(median: median) }
+
     public init(highlightClip: Double, shadowClip: Double, nearWhite: Double, median: Double, verdict: ExposureVerdict) {
         self.highlightClip = highlightClip
         self.shadowClip = shadowClip
@@ -54,6 +59,41 @@ public struct ExposureResult: Equatable, Sendable {
                                                     highlightClipLimit: highlightClipLimit,
                                                     shadowClipLimit: shadowClipLimit,
                                                     nearWhiteLimit: nearWhiteLimit))
+    }
+}
+
+/// How far the exposure is off, in stops — the actionable form of a highlight/shadow warning, since
+/// "overexposed" doesn't tell a photographer whether to pull a third of a stop or two stops.
+public struct ExposureOffset: Equatable, Sendable {
+    /// Positive = overexposed by this many stops (pull down); negative = underexposed (push up).
+    /// Already quantised to thirds, matching how exposure is actually dialled on the camera.
+    public let stops: Double
+    /// True when clipping destroyed the data needed to measure exactly, so `stops` is a floor
+    /// rather than a figure. Every pixel past the sensor's white point records the same value, so
+    /// once a meaningful part of the frame is clipped there is no way to know how far past it went
+    /// — the honest statement is "at least this much".
+    public let isAtLeast: Bool
+
+    /// Thirds of a stop, as a photographer reads them: "1⅓", "⅔", "2".
+    public var label: String {
+        let magnitude = abs(stops)
+        let whole = Int(magnitude)
+        let third = Int(((magnitude - Double(whole)) * 3).rounded())
+        // A rounded-up third carries into the whole number (2 + 3/3 reads as 3).
+        let carriedWhole = third == 3 ? whole + 1 : whole
+        let fraction = third == 3 ? 0 : third
+        let fractionText = ["", "⅓", "⅔"][fraction]
+        if carriedWhole == 0 && fraction == 0 { return "0" }
+        if carriedWhole == 0 { return fractionText }
+        return fractionText.isEmpty ? "\(carriedWhole)" : "\(carriedWhole)\(fractionText)"
+    }
+
+    /// The phrase the badge and tooltip show, e.g. "1⅓ stops over" or "at least 2 stops over".
+    public var summary: String {
+        guard stops != 0 else { return "correctly exposed" }
+        let direction = stops > 0 ? "over" : "under"
+        let unit = abs(stops) == 1 ? "stop" : "stops"
+        return "\(isAtLeast ? "at least " : "")\(label) \(unit) \(direction)"
     }
 }
 
@@ -150,6 +190,83 @@ public enum ExposureAnalyzer {
                 Double(medianBin) / Double(last))
     }
 
+    /// Luma [0,1] at a given percentile of the frame — the level below which `fraction` of pixels
+    /// fall. Used to ask "how bright is the content that's blowing out", which is what turns a
+    /// clipping warning into a stop count.
+    static func percentileLevel(_ histogram: [Int], total: Int, fraction: Double) -> Double {
+        guard total > 0, !histogram.isEmpty else { return 0 }
+        let target = Int((Double(total) * fraction).rounded())
+        var cumulative = 0
+        for (bin, count) in histogram.enumerated() {
+            cumulative += count
+            if cumulative >= target { return Double(bin) / Double(histogram.count - 1) }
+        }
+        return 1
+    }
+
+    /// sRGB → linear light. Stops are ratios of *light*, and the frame is gamma-encoded, so
+    /// measuring stops on the encoded values would overstate shadows and understate highlights.
+    static func linearize(_ value: Double) -> Double {
+        let v = min(max(value, 0), 1)
+        return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+    }
+
+    /// Mid-grey in linear light — the reference every reflected-light meter renders to, and the
+    /// same one the camera's own meter uses.
+    private static let middleGrey = 0.18
+
+    /// How far `frame` is off, in thirds of a stop: the frame's overall brightness measured against
+    /// a neutral mid-grey rendering, exactly as the camera's meter reads it.
+    ///
+    /// An earlier version tried to answer the more specific question a clipping warning raises —
+    /// "how far do I pull to stop losing these highlights" — by measuring where the blown content
+    /// sits. That cannot work, and the failure is physical rather than a bug: every pixel past the
+    /// white point records the identical value, so once the highlights clip, *how far* past they
+    /// went is unrecoverable. Measured against real tone curves it collapsed to "at least ⅓ stops"
+    /// for everything from a ⅔-stop push to a two-stop one, which is worse than saying nothing.
+    ///
+    /// The median is always measurable and shifts stop-for-stop with exposure, so it recovers a
+    /// mis-exposure faithfully. Its known limit is the one every reflected meter has: a deliberately
+    /// low-key or high-key frame reads off-neutral because it *is* off-neutral. That's why this is
+    /// only ever shown alongside a clipping verdict — it quantifies a warning the clipping already
+    /// justified, rather than second-guessing an intentional look.
+    public static func offset(median medianLevel: Double) -> ExposureOffset {
+        guard medianLevel.isFinite else { return ExposureOffset(stops: 0, isAtLeast: false) }
+        // A median pinned at either rail means more than half the frame is clipped; the true
+        // brightness is past what was recorded, so the figure becomes a floor.
+        let saturated = medianLevel >= 1 || medianLevel <= 0
+        let floored = min(max(medianLevel, Double(1) / Double(histogramBins - 1)), 1)
+        let stops = log2(linearize(floored) / middleGrey)
+        return ExposureOffset(stops: quantiseToThirds(stops), isAtLeast: saturated)
+    }
+
+    /// Convenience for measuring a frame directly (tests, live view).
+    public static func offset(_ frame: ScopeFrame) -> ExposureOffset {
+        guard frame.isValid else { return ExposureOffset(stops: 0, isAtLeast: false) }
+        return offset(median: measure(frame).median)
+    }
+
+    private static let oneThird = 1.0 / 3.0
+
+    /// Exposure is dialled in thirds, so a reading of "0.41 stops" is noise dressed as precision.
+    static func quantiseToThirds(_ stops: Double) -> Double {
+        guard stops.isFinite else { return 0 }
+        return (stops * 3).rounded() / 3
+    }
+
+    private static func histogramOf(_ frame: ScopeFrame) -> ([Int], Int) {
+        var histogram = [Int](repeating: 0, count: histogramBins)
+        let last = histogramBins - 1
+        frame.rgba.withUnsafeBufferPointer { src in
+            for p in stride(from: 0, to: frame.pixelCount * 4, by: 4) {
+                let y = lumaR * Double(src[p]) + lumaG * Double(src[p + 1]) + lumaB * Double(src[p + 2])
+                guard y.isFinite else { continue }
+                histogram[Int(min(max(y, 0), 1) * Double(last))] += 1
+            }
+        }
+        return (histogram, frame.pixelCount)
+    }
+
     /// Buckets the raw readings into a verdict. Clipping is the primary signal (it's lost data);
     /// brightness only gets a vote when clipping is within tolerance. Kept separate so a cached
     /// result can be re-bucketed when the photographer moves the tolerance.
@@ -196,20 +313,25 @@ public enum ExposureExplanation {
             highlightPhrase = "\(nw)% of the frame is washed-out near-white, past the \(nwLimit)% limit — a hazy sky or hot backdrop, even though only \(hi)% is fully clipped"
         }
 
+        // The stop figure is what makes a warning actionable — "overexposed" leaves the
+        // photographer guessing between a third of a stop and two.
+        let offset = result.offset
+        let correction = offset.stops == 0 ? "" : " The frame reads \(offset.summary) overall."
+
         if blown && crushed {
-            return "Overexposed and underexposed — \(highlightPhrase), and \(lo)% is crushed shadows (limit \(loLimit)%). High-contrast scene losing both ends."
+            return "Overexposed and underexposed — \(highlightPhrase), and \(lo)% is crushed shadows (limit \(loLimit)%). High-contrast scene losing both ends, so no single exposure change fixes it."
         }
         if blown {
-            return "Overexposed — \(highlightPhrase). That detail is gone for good, not recoverable by editing."
+            return "Overexposed — \(highlightPhrase). That detail is gone for good, not recoverable by editing.\(correction)"
         }
         if crushed {
-            return "Underexposed — \(lo)% of the frame is crushed shadows, past the \(loLimit)% limit. That detail is gone for good, not recoverable by editing."
+            return "Underexposed — \(lo)% of the frame is crushed shadows, past the \(loLimit)% limit. That detail is gone for good, not recoverable by editing.\(correction)"
         }
         switch result.verdict {
         case .over:
-            return "Overexposed — no hard clipping, but the frame reads very bright overall (median \(med)%). Likely a high-key look rather than blown detail; check it's intentional."
+            return "Overexposed — no hard clipping, but the frame reads very bright overall (median \(med)%, \(offset.summary)). Likely a high-key look rather than blown detail; check it's intentional."
         case .under:
-            return "Underexposed — no hard clipping, but the frame reads very dark overall (median \(med)%). Likely a low-key look rather than lost detail; check it's intentional."
+            return "Underexposed — no hard clipping, but the frame reads very dark overall (median \(med)%, \(offset.summary)). Likely a low-key look rather than lost detail; check it's intentional."
         case .good:
             return "Good exposure — highlights \(hi)% (limit \(hiLimit)%), near-white \(nw)% (limit \(nwLimit)%), shadows \(lo)% (limit \(loLimit)%), all within tolerance."
         }
