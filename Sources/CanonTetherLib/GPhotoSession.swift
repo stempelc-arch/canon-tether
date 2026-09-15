@@ -2917,20 +2917,14 @@ actor GPhotoSession {
                         return total
                     }
 
-                    var readings: [(offset: Int, value: Double)] = []
-                    var peakValue = 0.0
-                    var samplesPastPeak = 0
-                    // Best value each tile has reached so far. A tile still setting new bests is a
-                    // part of the scene that has not finished coming into focus.
-                    var tileBest: [Double] = []
-                    var samplesWithoutImprovement = 0
-                    /// Whether the most recent sample brought new parts of the scene into focus.
-                    var stillImproving = false
+                    /// All the stop rules, in one testable place (`CanonTetherCore`).
+                    ///
+                    /// They used to live inline here, which meant every calibration could only be
+                    /// checked by shooting a real sweep and reading the log — and four separate
+                    /// misfires reached the photographer that way.
+                    var monitor = FocusSweepMonitor()
                     /// For spotting an end of travel, where consecutive frames are identical.
                     var lastFingerprint: [Float]?
-                    var identicalFrames = 0
-                    /// Whether any sample has yet differed from the one before it.
-                    var hasMoved = false
 
                     /// Takes one sample here. Returns false once nothing in the frame is still
                     /// improving, which is the only safe signal that the sweep can stop.
@@ -2940,78 +2934,25 @@ actor GPhotoSession {
                         liveViewContinuation?.yield(frame)
                         guard let tiles = Self.previewTileSharpness(of: frame) else { return true }
 
-                        // Aggregate over the middle of the frame, for the falloff check.
-                        let grid = FocusDepthMap.grid
-                        var total = 0.0
-                        for row in (grid / 4)..<(grid - grid / 4) {
-                            for column in (grid / 4)..<(grid - grid / 4) {
-                                total += tiles[row * grid + column]
-                            }
+                        // Has the picture changed since the last sample? `nil` when it cannot
+                        // be told, which the monitor treats as movement — a false end of travel
+                        // truncates the sweep, while a false "moved" costs one sample.
+                        let now = Self.previewFingerprint(of: frame)
+                        var unchanged: Bool?
+                        if let previous = lastFingerprint, let now {
+                            unchanged = Self.fingerprintDistance(previous, now) < Self.identicalFrameThreshold
                         }
-                        readings.append((travelled, total))
-                        if total > peakValue {
-                            peakValue = total
-                            samplesPastPeak = 0
-                        } else if total < peakValue * Self.scanFalloffFraction {
-                            samplesPastPeak += 1
-                        } else {
-                            samplesPastPeak = 0
-                        }
+                        if unchanged != true, let now { lastFingerprint = now }
 
-                        // How many tiles just reached a new best?
-                        //
-                        // Aggregate sharpness alone is not enough to stop on: it is dominated by
-                        // whatever is brightest and most textured, and a real sweep ended while nine
-                        // tiles were still improving — the range came out 12 steps wide for a
-                        // subject that plainly ran further, and the far end of the stack was soft.
-                        // A part of the scene still sharpening is a part not yet measured.
-                        if tileBest.count != tiles.count { tileBest = [Double](repeating: 0, count: tiles.count) }
-                        var improved = 0
-                        for index in 0..<tiles.count where tiles[index] > tileBest[index] * 1.05 {
-                            tileBest[index] = tiles[index]
-                            improved += 1
-                        }
-                        stillImproving = improved > Self.scanImprovingTileFloor
-                        samplesWithoutImprovement = stillImproving ? 0 : samplesWithoutImprovement + 1
-
-                        // End of travel: the picture stops changing at all.
-                        //
-                        // This is separate from "the subject has fallen away", and needs to be:
-                        // against a stop the aggregate holds *steady* rather than falling, so the
-                        // falloff test never fires and the sweep kept extending to its cap. Measured
-                        // on every recent run, the lens stopped around +46 while the sweep drove on
-                        // to +147 — about a hundred steps and fifty samples spent re-photographing
-                        // one frame.
-                        if let previous = lastFingerprint,
-                           let now = Self.previewFingerprint(of: frame),
-                           Self.fingerprintDistance(previous, now) < Self.identicalFrameThreshold {
-                            identicalFrames += 1
-                            // Only once the lens has demonstrably moved.
-                            //
-                            // The sweep *starts* by driving into the near stop, so its first frames
-                            // are identical by design — reading that as "travel exhausted" stopped a
-                            // sweep after four samples and reported a textured subject as having
-                            // none. An end of travel is only meaningful after movement has been seen.
-                            // Movement alone is not enough, though — the blurred end of a sweep also
-                            // holds steady between steps — so the sweep must also have run long
-                            // enough to be worth trusting before it is allowed to stop itself.
-                            if hasMoved, samples.count >= Self.scanMinimumSamples,
-                               identicalFrames >= Self.scanEndOfTravelSamples {
-                                log("scan: end of travel — stopping after \(samples.count) samples")
-                                return false
-                            }
-                        } else {
-                            identicalFrames = 0
-                            hasMoved = true
-                            lastFingerprint = Self.previewFingerprint(of: frame)
-                        }
-
-                        let longEnough = samples.count >= Self.scanMinimumSamples
-                        let fallenAway = samplesPastPeak >= Self.scanFalloffSamples
-                        let nothingImproving = samplesWithoutImprovement >= Self.scanFalloffSamples
-                        if longEnough && fallenAway && nothingImproving {
+                        switch monitor.record(offset: travelled, tiles: tiles, unchanged: unchanged) {
+                        case .endOfTravel:
+                            log("scan: end of travel — stopping after \(samples.count) samples")
+                            return false
+                        case .measured:
                             log("scan: nothing left improving — stopping after \(samples.count) samples")
                             return false
+                        case nil:
+                            break
                         }
                         return true
                     }
@@ -3049,10 +2990,11 @@ actor GPhotoSession {
                     var extra = 0
                     // `identicalFrames` having tripped means the lens is against a stop; extending
                     // further only re-photographs the same frame.
-                    while extra < Self.scanMaxExtraSteps, !readings.isEmpty,
-                          !(hasMoved && identicalFrames >= Self.scanEndOfTravelSamples) {
+                    while extra < Self.scanMaxExtraSteps, !monitor.readings.isEmpty,
+                          !monitor.isAtEndOfTravel {
+                        let readings = monitor.readings
                         let best = readings.max { $0.value < $1.value }!
-                        if stillImproving || best.offset == readings.last!.offset {
+                        if monitor.stillImproving || best.offset == readings.last!.offset {
                             // Still climbing at the far end, or parts of the scene still coming
                             // into focus — either way there is more subject out there.
                             log("scan: subject still sharpening, extending outward")
