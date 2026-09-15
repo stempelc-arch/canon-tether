@@ -51,6 +51,24 @@ public struct FocusSweepMonitor {
     public static let improvingTileFraction = 0.03
     /// Never fewer than this, however small the box.
     public static let improvingTileMinimum = 3
+    /// How far a tile must climb back above its trough to count as a second surface arriving,
+    /// as a share of that tile's own observed range.
+    ///
+    /// Matches the prominence `FocusDepthMap.depthBehind` requires of a second peak, because the two
+    /// are looking for the same thing from opposite ends: the sweep has to still be *running* when
+    /// the contents of a see-through subject come into focus, or there is nothing for the depth map
+    /// to find. A mesh pen cup's sweep stopped at +9 while its pens came sharp at +29, so the range
+    /// covered the wires and the stack left the contents soft.
+    public static let risingAgainProminence = 0.10
+    /// Share of the judged tiles that must be climbing again before the sweep treats it as a second
+    /// surface rather than noise.
+    ///
+    /// Much higher than `improvingTileFraction`, because "above my own trough" is a far weaker
+    /// statement than "better than I have ever been", and noise clears it constantly. Measured
+    /// across the whole travel: an opaque mask runs 5–7% of tiles rising again, peaking at 11%
+    /// just past focus; a mesh pen cup, whose contents genuinely come into focus behind the wires,
+    /// runs 16–24%. 15% separates them with margin on both sides.
+    public static let risingAgainFraction = 0.15
     /// How much a tile must beat its own best by to count as improving, rather than as noise.
     public static let improvementRatio = 1.05
 
@@ -70,6 +88,10 @@ public struct FocusSweepMonitor {
 
     /// The subject box, if one was drawn — in normalised frame coordinates.
     private let region: FocusDepthMap.Region?
+    /// Lowest each tile has fallen to since it last set a best, and the lowest it has ever been —
+    /// together these say whether a tile is climbing *again*.
+    private var tileTrough: [Double] = []
+    private var tileFloor: [Double] = []
     private var peakValue = 0.0
     private var samplesPastPeak = 0
     private var tileBest: [Double] = []
@@ -145,15 +167,37 @@ public struct FocusSweepMonitor {
         // — the range came out 12 steps wide for a subject that plainly ran further, and the far end
         // of the stack was soft. A part of the scene still sharpening is a part not yet measured.
         // Counted over the subject only, for the reason given on `init(region:)`.
-        if tileBest.count != tiles.count { tileBest = [Double](repeating: 0, count: tiles.count) }
+        if tileBest.count != tiles.count {
+            tileBest = [Double](repeating: 0, count: tiles.count)
+            tileTrough = [Double](repeating: .greatestFiniteMagnitude, count: tiles.count)
+            tileFloor = [Double](repeating: .greatestFiniteMagnitude, count: tiles.count)
+        }
         var improved = 0
-        for index in inRegion where tiles[index] > tileBest[index] * Self.improvementRatio {
-            tileBest[index] = tiles[index]
-            improved += 1
+        var risingAgain = 0
+        for index in inRegion {
+            let value = tiles[index]
+            tileFloor[index] = Swift.min(tileFloor[index], value)
+            if value > tileBest[index] * Self.improvementRatio {
+                tileBest[index] = value
+                tileTrough[index] = value          // a new best restarts the descent
+                improved += 1
+            } else {
+                tileTrough[index] = Swift.min(tileTrough[index], value)
+                // Climbing back out of its own trough: something *else* is coming into focus here.
+                let range = tileBest[index] - tileFloor[index]
+                if range > 0, value - tileTrough[index] >= range * Self.risingAgainProminence {
+                    risingAgain += 1
+                }
+            }
         }
         let floor = Swift.max(Self.improvingTileMinimum,
                               Int(Double(inRegion.count) * Self.improvingTileFraction))
-        stillImproving = improved > floor
+        // A second surface arriving counts as the scene still coming into focus. Without this the
+        // sweep stops as soon as the *front* surface is done, which for anything you can see
+        // through is exactly where the interesting part begins.
+        let risingFloor = Swift.max(Self.improvingTileMinimum,
+                                    Int(Double(inRegion.count) * Self.risingAgainFraction))
+        stillImproving = improved > floor || risingAgain > risingFloor
         samplesWithoutImprovement = stillImproving ? 0 : samplesWithoutImprovement + 1
 
         // End of travel, guarded twice over.

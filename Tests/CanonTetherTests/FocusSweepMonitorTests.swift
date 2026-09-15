@@ -159,4 +159,41 @@ final class FocusSweepMonitorTests: XCTestCase {
         for offset in 1..<30 { _ = monitor.record(offset: offset, tiles: flat(1), unchanged: true) }
         XCTAssertTrue(monitor.isAtEndOfTravel)
     }
+
+    /// A second surface coming into focus must keep the sweep running.
+    ///
+    /// Tiles of a mesh peak on the wires and then fall away; when the contents behind come into
+    /// focus those same tiles climb *again*, without ever beating the wires. Counting only new
+    /// bests, the sweep stopped at +9 on a real pen cup whose pens came sharp at +29 — so the
+    /// depth map had nothing past the wires to find and the stack left the contents soft.
+    func testASecondSurfaceComingIntoFocusKeepsTheSweepOpen() {
+        var monitor = FocusSweepMonitor()
+        var stop: FocusSweepMonitor.Stop?
+        // The front surface sharpens and falls away.
+        for offset in 0..<14 where stop == nil {
+            let value = 1.0 - abs(Double(offset) - 4) * 0.12
+            stop = monitor.record(offset: offset, tiles: split(middle: max(value, 0.08), edge: 0.01),
+                                  unchanged: false)
+        }
+        // Now something behind it climbs back — never beating the front peak.
+        for offset in 14..<26 where stop == nil {
+            let value = 0.08 + Double(offset - 14) * 0.03
+            stop = monitor.record(offset: offset, tiles: split(middle: value, edge: 0.01), unchanged: false)
+        }
+        XCTAssertNil(stop, "tiles climbing out of their own trough are a second surface arriving")
+        XCTAssertTrue(monitor.stillImproving)
+    }
+
+    /// The counterpart: an opaque subject falls away and stays down, and must not be kept open by
+    /// the noise that always makes a few tiles tick upward.
+    func testAnOpaqueSubjectStillStopsTheSweep() {
+        var monitor = FocusSweepMonitor()
+        var stop: FocusSweepMonitor.Stop?
+        for offset in 0..<40 where stop == nil {
+            let value = 1.0 - abs(Double(offset) - 4) * 0.12
+            stop = monitor.record(offset: offset, tiles: split(middle: max(value, 0.05), edge: 0.01),
+                                  unchanged: false)
+        }
+        XCTAssertEqual(stop, .measured, "nothing is coming into focus any more")
+    }
 }

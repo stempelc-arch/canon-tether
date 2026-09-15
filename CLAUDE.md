@@ -1332,6 +1332,32 @@ rule want reconciling.
 Note `Tests/CanonTetherTests/FocusDepthMapTests.swift` had been committed **empty** and now holds the
 see-through and clustering cases.
 
+### The sweep has to still be running when the contents come into focus (2026-09-15)
+
+`depthBehind` was shipped and the next real run still missed the cup's pens — because the sweep
+stopped at **+9** and the pens come sharp at **+29**. The detection was starved of data: it looks for
+second peaks beyond the front surface, and the recording contained nothing past it.
+
+The cause is the stop rule counting only tiles that set a **new best**. A second surface behind a
+mesh never beats the mesh's own peak, so by that measure nothing is improving the moment the wires
+go soft. The monitor now also counts tiles climbing back out of their own trough
+(`risingAgainProminence = 0.10`, matching the prominence `depthBehind` requires), and keeps sweeping
+while enough of them are.
+
+**`risingAgainFraction` is 0.15, five times `improvingTileFraction`.** "Above my own trough" is a far
+weaker statement than "better than I have ever been", and noise clears it constantly — measured
+across the whole travel, an opaque mask runs 5–7% of tiles rising again (peaking at 11% just past
+focus) while the mesh cup runs 16–24%. The first threshold tried, reusing the 3% floor, never stopped
+any sweep at all.
+
+Replayed: the mask still stops at +49 after 48 of 96 samples, so the sweep halving is kept; the cup
+keeps running through the depth where its pens live.
+
+**Two rules that have to agree.** `FocusSweepMonitor` decides how far to look and
+`FocusDepthMap.depthBehind` decides what was found; shipping only the second left it correct and
+useless. When a feature spans a measurement and a decision made from it, check the measurement is
+still collecting where the decision needs to look.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).
