@@ -476,6 +476,19 @@ final class FocusStackModel: ObservableObject {
                 }
             }
             FileHandle.appendLog("auto-find: sweep saved to \(scanFolder.path)")
+            // The box, recorded with the sweep.
+            //
+            // Replaying a sweep offline is the whole reason it is kept, and every measurement that
+            // matters — depth clusters, coverage, the range itself — is taken *inside the box*. Not
+            // recording it meant after-the-fact analysis had to guess at it, and a guessed box
+            // quietly invalidates the conclusion: a box drawn slightly wide takes in background,
+            // which is indistinguishable from the subject being deeper than it is.
+            if let box = self.subjectRegion {
+                FileHandle.appendLog(String(format: "auto-find: subject box x %.3f y %.3f w %.3f h %.3f",
+                                            box.x, box.y, box.width, box.height))
+            } else {
+                FileHandle.appendLog("auto-find: no subject box drawn")
+            }
             self.sweepReference = reference
             let map = FocusDepthMap(framesByOffset: byOffset)
             FileHandle.appendLog("auto-find: \(byOffset.count) frames, \(map.usableTiles.count) usable tiles, "
