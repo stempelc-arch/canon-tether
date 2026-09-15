@@ -3139,7 +3139,15 @@ actor GPhotoSession {
                 // when it refuses the `capture-preview` that brings live view back — and without
                 // live view the focus nudges between frames do nothing. A bracket of identical
                 // frames is not a saving.
+                // Time each part of a frame separately.
+                //
+                // A bracket's cost was only ever visible as one number — seconds between frames —
+                // which is not enough to act on: shutter, download and the preview that re-arms
+                // live view are three different problems with three different fixes, and guessing
+                // which one owns the time has misled this feature more than once.
+                let frameStarted = Date()
                 try await withCommandLock { try await releaseShutterLocked(release) }
+                let shutterDone = Date()
                 lastFrameAt = Date()
                 // Collect whatever the camera is ready to hand over, not exactly one frame.
                 //
@@ -3150,8 +3158,15 @@ actor GPhotoSession {
                 captured.append(contentsOf: try await withCommandLock {
                     await drainDownloadsLocked(expected: plan.frameCount - captured.count)
                 })
+                let downloadDone = Date()
 
-                guard frame < plan.frameCount else { break }
+                guard frame < plan.frameCount else {
+                    log(String(format: "bracket: frame %d took %.2fs (shutter %.2f, download %.2f)",
+                               frame, downloadDone.timeIntervalSince(frameStarted),
+                               shutterDone.timeIntervalSince(frameStarted),
+                               downloadDone.timeIntervalSince(shutterDone)))
+                    break
+                }
                 try Task.checkCancellation()
                 progress(FocusBracketProgress(phase: .steppingFocus(frame: frame, of: plan.frameCount),
                                               framesCaptured: captured.count))
@@ -3161,6 +3176,11 @@ actor GPhotoSession {
                                                                     chunk: plan.stepsPerFrame,
                                                                     verify: false)
                 stepsTaken += moved
+                log(String(format: "bracket: frame %d took %.2fs (shutter %.2f, download %.2f, focus %.2f)",
+                           frame, Date().timeIntervalSince(frameStarted),
+                           shutterDone.timeIntervalSince(frameStarted),
+                           downloadDone.timeIntervalSince(shutterDone),
+                           Date().timeIntervalSince(downloadDone)))
                 if stalled {
                     log("bracket: focus reached the end of its travel after \(frame) frames — stopping")
                     status("Focus reached the end of its travel — bracket stopped at \(frame) frames")

@@ -142,7 +142,10 @@ struct FocusStackPanel: View {
     private var detailLine: String? {
         if model.isCapturing || model.isMerging || model.isRacking { return nil }
         if let render = model.lastRender {
-            return render.critique.advice.first
+            // Every finding, not just the first. A bracket can simultaneously have gaps in the
+            // middle and wasted frames at one end, and those call for opposite corrections —
+            // showing only one of them sends the photographer the wrong way.
+            return render.critique.advice.joined(separator: "  ")
         }
         if model.subjectRegion != nil {
             return "The scan sweeps focus, measures the subject's depth, and shoots the bracket itself."

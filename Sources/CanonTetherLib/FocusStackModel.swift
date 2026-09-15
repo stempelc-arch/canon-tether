@@ -778,6 +778,22 @@ final class FocusStackModel: ObservableObject {
                         self.mergeStatus = status
                     }
                 }
+                // Report what the merge actually achieved, frame by frame.
+                //
+                // The coverage map has always been computed and fed to the critique, but none of it
+                // was ever written down — so "the bracket shot more frames than it needed" could
+                // only be argued from folder listings and inference, never read off a log. Each
+                // frame's share is its portion of the merged image; a frame at 0% contributed
+                // nothing and is shooting time that bought no picture.
+                let shares = render.coverage.shares()
+                let covered = render.coverage.coverageFraction(region: region)
+                let dead = shares.filter { $0 < FocusStackCritique.deadFrameShare }.count
+                FileHandle.appendLog("merge: covered \(Int(covered * 100))% of the subject; "
+                                     + "\(dead) of \(shares.count) frames contributed nothing")
+                FileHandle.appendLog("merge: per-frame share "
+                                     + shares.map { "\(Int(($0 * 100).rounded()))%" }.joined(separator: " "))
+                for line in render.critique.advice { FileHandle.appendLog("merge: \(line)") }
+
                 await MainActor.run {
                     self.lastRender = render
                     self.mergeStatus = "Merged \(render.sourceCount) frames."
