@@ -549,4 +549,62 @@ private extension CoverageMap {
             return false
         }
     }
+
+    /// The optimised convolution must agree with the straightforward one exactly.
+    ///
+    /// `convolve` splits clamped borders from an unclamped interior because it is the innermost
+    /// loop of the merge — 87% of a stack's render time. The accumulation order is deliberately
+    /// unchanged so the result stays bit-for-bit identical, which is what lets a merged TIFF be
+    /// checksummed against a reference render.
+    func testConvolveMatchesTheNaiveImplementation() {
+        /// The original: clamp every tap, every channel, every pixel.
+        func naive(_ image: StackImage, kernel k: [Float]) -> StackImage {
+            let w = image.width, h = image.height, c = image.channels
+            let radius = k.count / 2
+            var horizontal = [Float](repeating: 0, count: w * h * c)
+            for y in 0..<h {
+                for x in 0..<w {
+                    for ch in 0..<c {
+                        var sum: Float = 0
+                        for t in 0..<k.count {
+                            let sx = min(max(x + t - radius, 0), w - 1)
+                            sum += k[t] * image.data[((y * w) + sx) * c + ch]
+                        }
+                        horizontal[((y * w) + x) * c + ch] = sum
+                    }
+                }
+            }
+            var vertical = [Float](repeating: 0, count: w * h * c)
+            for y in 0..<h {
+                for x in 0..<w {
+                    for ch in 0..<c {
+                        var sum: Float = 0
+                        for t in 0..<k.count {
+                            let sy = min(max(y + t - radius, 0), h - 1)
+                            sum += k[t] * horizontal[((sy * w) + x) * c + ch]
+                        }
+                        vertical[((y * w) + x) * c + ch] = sum
+                    }
+                }
+            }
+            return StackImage(width: w, height: h, channels: c, data: vertical)
+        }
+
+        let kernel: [Float] = [0.05, 0.25, 0.4, 0.25, 0.05]
+        var seed: UInt64 = 0x5eed
+        func random() -> Float {
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            return Float(seed >> 40) / Float(1 << 24)
+        }
+        // Sizes narrower than the kernel are the interesting ones: there the interior is empty and
+        // every column is a clamped border.
+        for (w, h, c) in [(1, 1, 1), (3, 2, 3), (4, 4, 1), (5, 5, 3), (17, 9, 3), (32, 24, 3)] {
+            let data = (0..<(w * h * c)).map { _ in random() }
+            let image = StackImage(width: w, height: h, channels: c, data: data)
+            let fast = StackPyramid.convolve(image, kernel: kernel)
+            let reference = naive(image, kernel: kernel)
+            XCTAssertEqual(fast.data, reference.data,
+                           "convolve disagreed with the naive form at \(w)x\(h)x\(c)")
+        }
+    }
 }

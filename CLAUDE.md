@@ -1168,6 +1168,50 @@ any comparison run, or the scan measures the whole scene and the runs are not co
 
 A rebuilt binary still requires the photographer to quit and relaunch the app.
 
+### The merge is the biggest phase, and it was 87% one loop (2026-09-15)
+
+Timed end to end, the merge had quietly become *larger than the bracket* — 5.6s per frame against
+the bracket's 3.7 — and CLAUDE.md's "59s → 22.7s on 8 cores" was long out of date. Instrumenting its
+phases on a real 24-frame stack (replayed offline through `FocusStackRenderer` in a `swiftc`
+harness, no camera needed):
+
+    align 16.1s | decode 12.6s | strips 199.3s | write 0.7s   = 228.7s
+
+So the strips were **87%** of it, and parallelising the decode — the obvious-looking target — would
+have bought 5%. Three changes, in order of what they were worth:
+
+- **`StackPyramid.convolve` split clamped borders from an unclamped interior.** It tested
+  `min(max(…))` per tap, per channel, per pixel — two branches in the innermost loop of the entire
+  merge — when only the first and last `radius` columns can fall outside. Strips 199s → 78s.
+- **`stripRows` 512 → 1024.** Every strip also processes `stripOverlap` rows either side and throws
+  them away: 512 rows of result cost 896 rows of work (1.75×), 1024 cost 1408 (1.375×). Strips
+  80s → 59s for 2% more peak memory.
+- **Preview and full-resolution decode run in parallel** (decode capped at 4 — it is bound by
+  ImageIO and the disk, not arithmetic). Decode 12.6s → 4.7s.
+
+**229s → 85s, with byte-identical output.** The accumulation order in `convolve` was deliberately
+left alone so the result stays bit-for-bit the same, which is what makes that claim checkable: the
+merged TIFF has the same SHA-256 after every one of these changes. Keep that property — it is the
+only cheap way to refactor this code safely. `FocusStackTests.testConvolveMatchesTheNaiveImplementation`
+pins it against a reference implementation, including sizes narrower than the kernel where the
+interior is empty and every column is a border.
+
+### The merge's memory scales with the bracket, and nothing was watching it (2026-09-15)
+
+Measured peak RSS on the same 24-frame stack: **22.6 GB, on a 32 GB machine.** Each strip worker
+holds *every frame's* band at once plus the pyramid built from it, so the footprint scales with
+frame count — and frame count is chosen by the subject, not by the machine. The same stack on a
+16 GB Mac would have swapped itself to a standstill or been killed, and nothing in the code noticed
+how much it was asking for.
+
+Workers are now bounded by memory as well as by cores: half of physical memory as the budget,
+divided by an estimate of per-worker bytes (`frames × bandRows × width × 3 × 4 × 2.4`), never below
+one — finishing slowly beats refusing to finish. On this machine that is 3 workers instead of 4,
+costing ~6s and bounding the peak.
+
+**A benchmark that only reports wall time hides this entirely.** `/usr/bin/time -l` and its
+`maximum resident set size` is what turned a pure speed win into a portability fix.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).

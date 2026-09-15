@@ -26,7 +26,13 @@ import CanonTetherCore
 public enum FocusStackRenderer {
     /// Rows per strip. Chosen so a ten-frame bracket's resident set stays a few hundred MB at
     /// 1DX II resolution: 10 frames × 5472 px × (512 + 2×192) rows × 3 ch × 4 B ≈ 590 MB peak.
-    static let stripRows = 512
+    /// Rows of final image each strip produces.
+    ///
+    /// 1024 rather than 512: every strip also processes `stripOverlap` rows either side and throws
+    /// them away, so a 512-row strip does 896 rows of work for 512 rows of result — 1.75× — while a
+    /// 1024-row strip does 1408 for 1024, or 1.375×. Measured on a 24-frame bracket that is 80s of
+    /// strip time against 59s, for 2% more peak memory, with byte-identical output.
+    static let stripRows = 1024
 
     /// Rows of overlap on each side of a strip, discarded from the result.
     ///
@@ -94,14 +100,29 @@ public enum FocusStackRenderer {
     ) throws -> Render {
         guard urls.count >= 2 else { throw RenderError.needsTwoFrames }
 
+        // Phase timings. The merge turned out to be the *largest* phase of a stack — 5.6s a frame
+        // against the bracket's 3.7 — and which part of it owns that was not recorded anywhere.
+        let started = Date()
+        var mark = started
+        func phase(_ name: String) {
+            let now = Date()
+            FileHandle.appendLog(String(format: "merge: %@ %.1fs", name, now.timeIntervalSince(mark)))
+            mark = now
+        }
+
         // 1. Alignment, from small previews.
         progress(0.02, "Aligning frames…")
-        var previews: [StackImage] = []
-        for url in urls {
-            guard let preview = loadImage(url, maxPixel: alignmentEdge) else {
-                throw RenderError.decodeFailed(url)
+        // Decoded in parallel: 24 independent JPEG decodes, and they were costing 16s in a row.
+        var previewSlots = [StackImage?](repeating: nil, count: urls.count)
+        previewSlots.withUnsafeMutableBufferPointer { slots in
+            DispatchQueue.concurrentPerform(iterations: urls.count) { index in
+                slots[index] = loadImage(urls[index], maxPixel: alignmentEdge)
             }
-            previews.append(preview)
+        }
+        var previews: [StackImage] = []
+        for (index, slot) in previewSlots.enumerated() {
+            guard let slot else { throw RenderError.decodeFailed(urls[index]) }
+            previews.append(slot)
         }
         guard previews.allSatisfy({ $0.matchesShape(of: previews[0]) }) else {
             throw RenderError.sizeMismatch
@@ -112,23 +133,68 @@ public enum FocusStackRenderer {
         // merge of N identical frames.
         let framesAreStatic = FocusStackDiagnostics.framesAreStatic(previews)
 
+        phase("align")
+
         // 2. Decode every frame to a scratch file at full resolution.
         let scratchDirectory = try makeScratchDirectory()
         defer { try? FileManager.default.removeItem(at: scratchDirectory) }
-        var planes: [ScratchPlane] = []
-        var fullSize: (width: Int, height: Int)?
-        for (index, url) in urls.enumerated() {
-            progress(0.05 + 0.45 * Double(index) / Double(urls.count), "Reading \(url.lastPathComponent)…")
-            guard let cg = loadCGImage(url) else { throw RenderError.decodeFailed(url) }
-            if let size = fullSize {
-                guard cg.width == size.width, cg.height == size.height else { throw RenderError.sizeMismatch }
-            } else {
-                fullSize = (cg.width, cg.height)
+        // Also in parallel. Each frame decodes to its own scratch file and shares nothing, so the
+        // only coordination is collecting the results and the first error.
+        //
+        // Concurrency is capped rather than left to `concurrentPerform`'s default: a full-
+        // resolution decode holds a 20 MP RGBA16 CGImage plus its packed copy, so letting every
+        // core decode at once multiplies that by the core count for no gain — this is bounded by
+        // ImageIO and the disk write, not by arithmetic.
+        var planeSlots = [ScratchPlane?](repeating: nil, count: urls.count)
+        var sizeSlots = [(width: Int, height: Int)?](repeating: nil, count: urls.count)
+        var decodeError: Error?
+        let decodeLock = NSLock()
+        var decoded = 0
+        let decodeWorkers = min(4, urls.count)
+        planeSlots.withUnsafeMutableBufferPointer { planeBuffer in
+            sizeSlots.withUnsafeMutableBufferPointer { sizeBuffer in
+                DispatchQueue.concurrentPerform(iterations: decodeWorkers) { worker in
+                    var index = worker
+                    while index < urls.count {
+                        decodeLock.lock()
+                        let stop = decodeError != nil
+                        decodeLock.unlock()
+                        if stop { return }
+                        do {
+                            guard let cg = loadCGImage(urls[index]) else {
+                                throw RenderError.decodeFailed(urls[index])
+                            }
+                            sizeBuffer[index] = (cg.width, cg.height)
+                            planeBuffer[index] = try ScratchPlane(
+                                image: cg,
+                                url: scratchDirectory.appendingPathComponent("frame-\(index).raw"))
+                        } catch {
+                            decodeLock.lock()
+                            decodeError = decodeError ?? error
+                            decodeLock.unlock()
+                            return
+                        }
+                        decodeLock.lock()
+                        decoded += 1
+                        let done = decoded
+                        decodeLock.unlock()
+                        progress(0.05 + 0.45 * Double(done) / Double(urls.count), "Reading frames…")
+                        index += decodeWorkers
+                    }
+                }
             }
-            planes.append(try ScratchPlane(image: cg,
-                                           url: scratchDirectory.appendingPathComponent("frame-\(index).raw")))
         }
-        guard let size = fullSize else { throw RenderError.decodeFailed(urls[0]) }
+        if let decodeError { throw decodeError }
+        var planes: [ScratchPlane] = []
+        for (index, slot) in planeSlots.enumerated() {
+            guard let slot else { throw RenderError.decodeFailed(urls[index]) }
+            planes.append(slot)
+        }
+        guard let size = sizeSlots.first ?? nil else { throw RenderError.decodeFailed(urls[0]) }
+        guard sizeSlots.allSatisfy({ $0?.width == size.width && $0?.height == size.height }) else {
+            throw RenderError.sizeMismatch
+        }
+        phase("decode")
 
         // Rescale the preview transforms to full resolution. Scale is dimensionless; translation
         // is in pixels and must be multiplied by exactly the factor between the two resolutions.
@@ -168,7 +234,28 @@ public enum FocusStackRenderer {
             let raw = buffer
             // Leave a core or two for the UI and the live-view decode. Measured, saturating all of
             // them made the feed appear dead during a merge, which is the more visible failure.
-            let workers = Swift.max(1, ProcessInfo.processInfo.activeProcessorCount - 2)
+            let cores = Swift.max(1, ProcessInfo.processInfo.activeProcessorCount - 2)
+            // Bounded by memory as well as by cores.
+            //
+            // Each worker holds *every frame's* band at once, plus the pyramid the merge builds
+            // from them — so the footprint scales with the bracket, and the bracket is chosen by
+            // the subject rather than by the machine. Measured on a 24-frame stack: 22.6 GB peak,
+            // on a 32 GB Mac. The same stack on a 16 GB machine would swap itself to a standstill
+            // or be killed, and nothing in the code noticed how much it was asking for.
+            //
+            // Half of physical memory is the budget; one worker is always allowed, because
+            // finishing slowly beats refusing to finish.
+            let bandRows = Swift.min(size.height, stripRows + 2 * stripOverlap)
+            let bytesPerWorker = Double(urls.count) * Double(bandRows) * Double(size.width)
+                * 3 * 4 * 2.4      // channels x Float x (bands + pyramid + merged)
+            let budget = Double(ProcessInfo.processInfo.physicalMemory) * 0.5
+            let byMemory = Swift.max(1, Int(budget / Swift.max(bytesPerWorker, 1)))
+            let workers = Swift.min(cores, byMemory)
+            if workers < cores {
+                FileHandle.appendLog(String(format:
+                    "merge: %d workers (memory-bound: %.1f GB per worker, %.0f GB budget)",
+                    workers, bytesPerWorker / 1_073_741_824, budget / 1_073_741_824))
+            }
             let batches = Swift.min(workers, stripRanges.count)
             DispatchQueue.concurrentPerform(iterations: batches) { batch in
                 var index = batch
@@ -215,11 +302,15 @@ public enum FocusStackRenderer {
             }
         }
         if let stripError { throw stripError }
+        phase("strips")
 
         // 4. Write the merged image.
         progress(0.97, "Writing merged image…")
         let destination = outputURL ?? defaultOutputURL(for: urls[0])
         try writeTIFF(output, width: size.width, height: size.height, to: destination)
+        phase("write")
+        FileHandle.appendLog(String(format: "merge: total %.1fs for %d frames",
+                                    Date().timeIntervalSince(started), urls.count))
 
         let coverage = coverageAccumulator?.map()
             ?? CoverageMap(width: 1, height: 1, sourceCount: urls.count, winner: [0], confidence: [0])

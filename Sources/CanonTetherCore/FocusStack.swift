@@ -128,38 +128,91 @@ public enum StackPyramid {
         guard image.isValid, !k.isEmpty else { return image }
         let w = image.width, h = image.height, c = image.channels
         let radius = k.count / 2
+        let taps = k.count
+
+        // Borders are clamped, the interior is not.
+        //
+        // The straightforward version tested `min(max(…))` per tap, per channel, per pixel — two
+        // branches in the innermost loop of the whole merge, which is 87% of a stack's render time
+        // (199s of 229s on a 24-frame bracket). Only the first and last `radius` columns and rows
+        // can actually fall outside, so the interior runs as a flat walk at a fixed stride and the
+        // edges keep the clamped form. The accumulation order is unchanged, so the result is
+        // bit-for-bit identical to the naive version — worth preserving, since the merged TIFF is
+        // checksummed against a reference render.
         var horizontal = [Float](repeating: 0, count: w * h * c)
         image.data.withUnsafeBufferPointer { src in
             horizontal.withUnsafeMutableBufferPointer { dst in
-                for y in 0..<h {
-                    let row = y * w
-                    for x in 0..<w {
-                        for ch in 0..<c {
-                            var sum: Float = 0
-                            for t in 0..<k.count {
-                                let sx = min(max(x + t - radius, 0), w - 1)
-                                sum += k[t] * src[(row + sx) * c + ch]
+                k.withUnsafeBufferPointer { kp in
+                    let lo = min(radius, w)
+                    let hi = max(lo, w - radius)
+                    for y in 0..<h {
+                        let row = y * w
+                        func clamped(_ x: Int) {
+                            for ch in 0..<c {
+                                var sum: Float = 0
+                                for t in 0..<taps {
+                                    let sx = min(max(x + t - radius, 0), w - 1)
+                                    sum += kp[t] * src[(row + sx) * c + ch]
+                                }
+                                dst[(row + x) * c + ch] = sum
                             }
-                            dst[(row + x) * c + ch] = sum
                         }
+                        for x in 0..<lo { clamped(x) }
+                        for x in lo..<hi {
+                            let base = (row + x - radius) * c
+                            let out = (row + x) * c
+                            for ch in 0..<c {
+                                var sum: Float = 0
+                                var p = base + ch
+                                for t in 0..<taps {
+                                    sum += kp[t] * src[p]
+                                    p += c
+                                }
+                                dst[out + ch] = sum
+                            }
+                        }
+                        for x in hi..<w { clamped(x) }
                     }
                 }
             }
         }
+
         var vertical = [Float](repeating: 0, count: w * h * c)
         horizontal.withUnsafeBufferPointer { src in
             vertical.withUnsafeMutableBufferPointer { dst in
-                for y in 0..<h {
-                    for x in 0..<w {
-                        for ch in 0..<c {
-                            var sum: Float = 0
-                            for t in 0..<k.count {
-                                let sy = min(max(y + t - radius, 0), h - 1)
-                                sum += k[t] * src[(sy * w + x) * c + ch]
+                k.withUnsafeBufferPointer { kp in
+                    let lo = min(radius, h)
+                    let hi = max(lo, h - radius)
+                    let stride = w * c
+                    func clampedRow(_ y: Int) {
+                        for x in 0..<w {
+                            for ch in 0..<c {
+                                var sum: Float = 0
+                                for t in 0..<taps {
+                                    let sy = min(max(y + t - radius, 0), h - 1)
+                                    sum += kp[t] * src[(sy * w + x) * c + ch]
+                                }
+                                dst[(y * w + x) * c + ch] = sum
                             }
-                            dst[(y * w + x) * c + ch] = sum
                         }
                     }
+                    for y in 0..<lo { clampedRow(y) }
+                    for y in lo..<hi {
+                        let base = (y - radius) * stride
+                        let out = y * stride
+                        for x in 0..<w {
+                            for ch in 0..<c {
+                                var sum: Float = 0
+                                var p = base + x * c + ch
+                                for t in 0..<taps {
+                                    sum += kp[t] * src[p]
+                                    p += stride
+                                }
+                                dst[out + x * c + ch] = sum
+                            }
+                        }
+                    }
+                    for y in hi..<h { clampedRow(y) }
                 }
             }
         }
