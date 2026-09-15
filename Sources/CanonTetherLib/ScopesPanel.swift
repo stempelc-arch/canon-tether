@@ -38,13 +38,9 @@ enum ScopeSampler {
     }
 
     private static func load(_ url: URL, maxPixel: Int) -> ScopeFrame? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
-            kCGImageSourceCreateThumbnailWithTransform: true
-        ]
-        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        // See `ImageThumbnail`: asking ImageIO directly returns a JPEG's 160×120 EXIF thumbnail
+        // whatever size is requested, which would have the scopes measuring a postage stamp.
+        guard let cg = ImageThumbnail.load(url, maxPixel: maxPixel) else { return nil }
         return frame(from: cg, maxPixel: maxPixel)
     }
 

@@ -11,6 +11,7 @@ public struct ContentView: View {
     @StateObject private var reviewWindow = ReviewWindowController()
     @StateObject private var sleepPreventer = SleepPreventer()
     @StateObject private var updateChecker = UpdateChecker()
+    @StateObject private var focusStackWindow = FocusStackWindowController()
     @State private var showingPreferences = false
     /// When on, the filmstrip hides shots with Soft/Borderline focus or Over/Under exposure, showing
     /// only the good ones — a fast triage pass so the photographer's picks come from shots worth
@@ -141,6 +142,16 @@ public struct ContentView: View {
                   ? "Client screen is on — click to turn it off (⌘R)"
                   : "Show the client screen, full-screen on the other monitor (⌘R)")
             .keyboardShortcut("r", modifiers: .command)
+        }
+
+        ToolbarItem {
+            Button {
+                focusStackWindow.toggle(viewModel: viewModel)
+            } label: {
+                Label("Focus Stack", systemImage: "camera.metering.center.weighted")
+            }
+            .help("Shoot a focus bracket and merge it into one all-in-focus image")
+            .disabled(!viewModel.isConnected)
         }
 
         ToolbarItem {

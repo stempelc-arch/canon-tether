@@ -29,7 +29,27 @@ final class CameraViewModel: ObservableObject {
     /// silently sitting on "waiting for camera".
     let gphotoInstalled = GPhotoSession.isInstalled
 
-    private let session = GPhotoSession()
+    // Internal rather than private: `FocusStackModel` drives brackets over the same session, so
+    // a bracket shares the one shell (and one command lock) with everything else. A second session
+    // would mean a second gphoto2 claiming the camera — which on this body can cost a re-pair.
+    let session = GPhotoSession()
+
+    /// Focus stacking runs on its own observable object (see `FocusStackModel`) but is owned here,
+    /// so it shares this view model's session and outlives the sheet that presents it — a bracket
+    /// keeps shooting if the photographer closes and reopens the panel.
+    private(set) lazy var focusStack: FocusStackModel = {
+        let model = FocusStackModel(session: session, liveView: liveViewFeed)
+        model.onStackMerged = { [weak self] url in self?.registerMergedStack(url) }
+        // Ranging drives focus, which is a live-view operation, and the photographer has to see
+        // what they're marking — so it routes through the same toggle the toolbar uses rather than
+        // starting live view behind the view model's back and desyncing the button.
+        // Set, never toggle. The session stops live view itself around a bracket, so this object's
+        // `isLiveViewOn` can be stale at exactly the moment the restart matters — and a toggle that
+        // believes it is already on does nothing, leaving the panel dark and focus drive dead.
+        model.onSetLiveView = { [weak self] on in self?.setLiveView(on) }
+        model.onRestartLiveView = { [weak self] in self?.restartLiveView() }
+        return model
+    }()
 
     /// Drives the status indicator dot: red on error, green when the camera is live, amber while
     /// still working toward a connection.
@@ -101,6 +121,14 @@ final class CameraViewModel: ObservableObject {
                     else { return nil }
                     return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
                 }.value
+                // Frames are dropped once live view is off, and must **not** switch it back on.
+                //
+                // An earlier version treated an arriving frame as proof the feed was live and
+                // raised the flag. That is wrong at the one moment it matters: decoding is
+                // asynchronous, so a frame already in flight lands *after* a stop and resurrects
+                // the flag — leaving the app showing LIVE over a stale frame with nothing running.
+                // The genuine desync this was guarding against is fixed at its source, in
+                // `restartLiveView`, by raising the flag only once the restart has completed.
                 guard self.isLiveViewOn else { continue }
                 self.liveViewFeed.update(image)
             }
@@ -182,6 +210,26 @@ final class CameraViewModel: ObservableObject {
         statusText = "Captured \(url.lastPathComponent)"
     }
 
+    /// Puts a freshly merged focus stack into the gallery. The bracket's own frames never appear —
+    /// only this one file does, which is what makes a focus stack read as a single capture.
+    private func registerMergedStack(_ url: URL) {
+        // Same project check as `handleNewCapture`, one level deeper: the merged image lives inside
+        // the bracket's subfolder, so it is the *folder* that must belong to the current project.
+        let folder = url.deletingLastPathComponent()
+        guard folder.deletingLastPathComponent() == CaptureLocation.directory else { return }
+        if let existing = captures.firstIndex(of: url) {
+            // A re-merge writes the same path. Remove and re-append so SwiftUI sees a change and
+            // views holding a cached thumbnail of the previous render reload it.
+            captures.remove(at: existing)
+            captures.append(url)
+        } else {
+            captures.append(url)
+            captureCount += 1
+        }
+        lastCaptureURL = url
+        statusText = "Merged focus stack \(url.lastPathComponent)"
+    }
+
     // MARK: - Gallery actions
 
     func revealInFinder(_ url: URL) {
@@ -250,14 +298,25 @@ final class CameraViewModel: ObservableObject {
         let dir = CaptureLocation.directory
         guard let urls = try? FileManager.default.contentsOfDirectory(
             at: dir,
-            includingPropertiesForKeys: [.contentModificationDateKey],
+            includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else { return }
 
-        let images = urls.filter {
+        var images = urls.filter {
             CaptureLocation.imageExtensions.contains($0.pathExtension.lowercased())
                 // A live-view frame stranded by a crash is not a shot; never list it as one.
                 && !$0.lastPathComponent.hasPrefix(GPhotoSession.previewFilenamePrefix)
+        }
+        // Focus-stack folders contribute exactly one entry each: the merged image. The listing
+        // above is non-recursive, so the bracket's source frames are already excluded by living a
+        // level down — this reaches in for the one file that *is* a photograph. A folder with no
+        // merged image yet (interrupted bracket) contributes nothing, which is correct.
+        // "Focus Scan"/"Focus Map" folders hold diagnostic sweeps, not photographs; only stack
+        // folders contribute a capture (their merged image).
+        for url in urls where CaptureLocation.isStackFolder(url) {
+            let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            guard isDirectory, let merged = CaptureLocation.mergedImage(inStackFolder: url) else { continue }
+            images.append(merged)
         }
         // Fetch each date once before sorting — stat-ing inside the comparator did O(n log n)
         // syscalls (10,000+ for a 1,000-file folder) on the main actor, a visible beachball on
@@ -320,6 +379,30 @@ final class CameraViewModel: ObservableObject {
     /// let a capture in flight swallow the toggle.
     func toggleLiveView() {
         setLiveView(!isLiveViewOn)
+    }
+
+    /// Starts live view whether or not this object thinks it is already running.
+    ///
+    /// Needed after a bracket: the session stops the feed itself (and the loop can stop *itself*
+    /// after the camera refuses previews for a moment), so `isLiveViewOn` here can say "on" while
+    /// nothing is running — and the ordinary guarded path would then do nothing at all, leaving the
+    /// panel dark and focus drive dead for the next stack.
+    func restartLiveView() {
+        let previous = liveViewToggleTask
+        liveViewToggleTask = Task { [weak self] in
+            _ = await previous?.result
+            guard let self else { return }
+            await self.session.stopLiveView()
+            await self.session.startLiveView()
+            // The flag is raised **after** the restart, not before.
+            //
+            // Stopping makes the session publish "live view inactive", and the observer above sets
+            // `isLiveViewOn = false` in response — so a flag raised beforehand was immediately
+            // lowered again. The frame consumer then dropped every arriving frame
+            // (`guard self.isLiveViewOn else { continue }`), which is why the session could be
+            // streaming 2,500 frames while the panel sat on "Waiting for live view…".
+            self.isLiveViewOn = true
+        }
     }
 
     private func setLiveView(_ on: Bool) {

@@ -100,7 +100,11 @@ public enum FocusAnalyzer {
 
     /// The raw, unmapped read: the peak-region sharpness ratio and where that region sits. Split out
     /// so both `evaluate` and the calibration tests work off the same numbers.
-    static func measure(_ frame: ScopeFrame) -> (sharpness: Double, peak: ScopePoint?) {
+    ///
+    /// Public because end-of-travel detection compares this number between preview frames: the
+    /// 0–100 score is deliberately compressed by `halfScoreRatio`, which squashes exactly the
+    /// differences that detection depends on, so it needs the raw ratio.
+    public static func measure(_ frame: ScopeFrame) -> (sharpness: Double, peak: ScopePoint?) {
         guard frame.isValid, frame.width >= 3, frame.height >= 3 else { return (0, nil) }
         let w = frame.width, h = frame.height
 
