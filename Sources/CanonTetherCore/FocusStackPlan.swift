@@ -159,7 +159,10 @@ public struct FocusStackPlan: Equatable, Sendable {
 public struct FocusStackCritique: Equatable {
     public enum Verdict: Equatable {
         case good
-        case gaps(fraction: Double)
+        /// The subject runs past one end of the bracket: the outermost frame is still winning a
+        /// large share, so there was more subject where the bracket stopped looking.
+        case rangeClippedAtStart(share: Double)
+        case rangeClippedAtEnd(share: Double)
         case wastedAtStart(frames: Int)
         case wastedAtEnd(frames: Int)
     }
@@ -169,19 +172,41 @@ public struct FocusStackCritique: Equatable {
     /// Frames whose share of the merged image is below this are doing essentially nothing — the
     /// bracket travelled past the subject before or after those frames.
     public static let deadFrameShare = 0.01
-    /// Below this covered fraction the bracket has real holes in it.
-    public static let minimumCoverage = 0.8
+    /// An end frame winning more than this is holding territory that continues past it.
+    ///
+    /// An interior frame wins a slice of the subject and hands over to its neighbour. An *end*
+    /// frame has no neighbour on one side, so when it wins a large share the likeliest reason is
+    /// that the subject carried on and the bracket did not.
+    public static let clippedEndShare = 0.15
 
     public init(coverage: CoverageMap,
                 region: (x: Double, y: Double, width: Double, height: Double)? = nil) {
         var found: [Verdict] = []
-        // Judged over the subject where one was marked: the background is *meant* to be soft, and
-        // counting it produced alarming advice about perfectly good stacks.
-        let covered = coverage.coverageFraction(region: region)
-        if covered < FocusStackCritique.minimumCoverage {
-            found.append(.gaps(fraction: 1 - covered))
-        }
+        // Coverage is deliberately **not** judged here any more.
+        //
+        // `confidence` is the winning frame's share of the total sharpness at a cell, so the more
+        // frames a bracket has, the more of them are nearly sharp anywhere, and the lower every
+        // winner's share becomes. The metric falls as sampling improves. Measured on two brackets
+        // of the same subject minutes apart: 20 frames scored 67% and 24 frames scored 68%, while
+        // a direct per-tile comparison of the two merged images found the 24-frame result **14.7%
+        // sharper** in median tile sharpness, better in 180 of 263 textured tiles. It reported the
+        // better stack as no better, and told the photographer 33% of a visibly excellent stack
+        // "was never sharp" — advice to shoot more frames, which is what they were already
+        // complaining about.
+        //
+        // The deeper reason is not a bad threshold: a single merge cannot know whether a *denser*
+        // bracket would have been sharper, because the sharpest frame it has is the only evidence
+        // it has. That question is answerable by shooting two brackets and comparing, and not
+        // otherwise. So the critique now reports only what one merge can establish.
         let shares = coverage.shares()
+        // The subject running past the end of the bracket, though, is visible in one merge: the
+        // outermost frame keeps winning instead of handing over.
+        if let first = shares.first, first > FocusStackCritique.clippedEndShare {
+            found.append(.rangeClippedAtStart(share: first))
+        }
+        if let last = shares.last, shares.count > 1, last > FocusStackCritique.clippedEndShare {
+            found.append(.rangeClippedAtEnd(share: last))
+        }
         let leading = shares.prefix { $0 < FocusStackCritique.deadFrameShare }.count
         let trailing = shares.reversed().prefix { $0 < FocusStackCritique.deadFrameShare }.count
         // A stack where *every* frame is dead is a degenerate read, not advice worth giving.
@@ -198,9 +223,10 @@ public struct FocusStackCritique: Equatable {
             switch verdict {
             case .good:
                 return "Focus coverage looks complete."
-            case .gaps(let fraction):
-                let percent = Int((fraction * 100).rounded())
-                return "About \(percent)% of the subject was never sharp — use a finer step, or more frames."
+            case .rangeClippedAtStart(let share):
+                return "The first frame covers \(Int((share * 100).rounded()))% of the image — the subject probably starts before the bracket did."
+            case .rangeClippedAtEnd(let share):
+                return "The last frame covers \(Int((share * 100).rounded()))% of the image — the subject probably continues past where the bracket stopped."
             case .wastedAtStart(let frames):
                 return "The first \(frames) frame\(frames == 1 ? "" : "s") added nothing — start the bracket closer to the subject."
             case .wastedAtEnd(let frames):

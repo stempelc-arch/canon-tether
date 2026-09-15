@@ -444,12 +444,13 @@ final class FocusStackTests: XCTestCase {
                                winner: [0, 0, 1, 1], confidence: [1, 1, 1, 1])
         XCTAssertEqual(FocusStackCritique(coverage: good).verdicts, [.good])
 
-        // Nothing was convincingly sharp anywhere.
-        let gappy = CoverageMap(width: 2, height: 2, sourceCount: 2,
-                                winner: [0, 0, 1, 1], confidence: [0.1, 0.1, 0.1, 0.1])
-        guard case .gaps = FocusStackCritique(coverage: gappy).verdicts.first else {
-            return XCTFail("expected a gap verdict")
-        }
+        // Low confidence everywhere is *not* a defect verdict any more. The winner's share falls
+        // as frames are added, so judging it told photographers to shoot more frames precisely
+        // when they already had enough.
+        let lowConfidence = CoverageMap(width: 2, height: 2, sourceCount: 2,
+                                        winner: [0, 0, 1, 1], confidence: [0.1, 0.1, 0.1, 0.1])
+        XCTAssertEqual(FocusStackCritique(coverage: lowConfidence).verdicts, [.good],
+                       "a merge cannot know whether a denser bracket would have been sharper")
 
         // Three frames where the first contributes nothing: the bracket started too far away.
         let wastedStart = CoverageMap(width: 4, height: 1, sourceCount: 3,
@@ -512,26 +513,40 @@ final class FocusCoverageRegionTests: XCTestCase {
 
         let subject = map.coverageFraction(region: (x: 0.3, y: 0.3, width: 0.4, height: 0.4))
         XCTAssertGreaterThan(subject, 0.9, "the subject itself is covered")
-
-        // And the advice must follow the subject reading.
-        let critique = FocusStackCritique(coverage: map,
-                                          region: (x: 0.3, y: 0.3, width: 0.4, height: 0.4))
-        XCTAssertEqual(critique.verdicts, [.good])
-        XCTAssertTrue(FocusStackCritique(coverage: map).verdicts.contains { if case .gaps = $0 { return true }; return false },
-                      "without a subject region the whole frame is judged, gaps and all")
     }
 
-    /// A genuine gap inside the subject must still be reported.
-    func testGapsInsideTheSubjectAreStillReported() {
-        let w = 20, h = 20
-        var confidence = [Float](repeating: 0, count: w * h)
-        for row in 6..<10 {
-            for column in 6..<14 { confidence[row * w + column] = 1 }   // only half the subject
+    /// The one thing a single merge *can* establish about its own range: an end frame that keeps
+    /// winning instead of handing over to a neighbour means the subject ran past the bracket.
+    func testRangeClippedAtEitherEndIsReported() {
+        // Ten cells, three frames. The last frame holds four of them — it never handed over.
+        let clippedEnd = CoverageMap(width: 10, height: 1, sourceCount: 3,
+                                     winner: [0, 1, 1, 1, 1, 1, 2, 2, 2, 2],
+                                     confidence: [Float](repeating: 1, count: 10))
+        XCTAssertTrue(clippedEnd.verdictsContainClippedEnd,
+                      "the subject continues past where the bracket stopped")
+
+        let clippedStart = CoverageMap(width: 10, height: 1, sourceCount: 3,
+                                       winner: [0, 0, 0, 0, 1, 1, 1, 1, 1, 2],
+                                       confidence: [Float](repeating: 1, count: 10))
+        XCTAssertTrue(FocusStackCritique(coverage: clippedStart).verdicts.contains {
+            if case .rangeClippedAtStart = $0 { return true }; return false
+        })
+
+        // A bracket that hands over cleanly at both ends is not criticised.
+        let clean = CoverageMap(width: 10, height: 1, sourceCount: 3,
+                                winner: [0, 1, 1, 1, 1, 1, 1, 1, 2, 2],
+                                confidence: [Float](repeating: 1, count: 10))
+        XCTAssertFalse(FocusStackCritique(coverage: clean).verdicts.contains {
+            if case .rangeClippedAtStart = $0 { return true }; return false
+        })
+    }
+}
+
+private extension CoverageMap {
+    var verdictsContainClippedEnd: Bool {
+        FocusStackCritique(coverage: self).verdicts.contains {
+            if case .rangeClippedAtEnd = $0 { return true }
+            return false
         }
-        let map = CoverageMap(width: w, height: h, sourceCount: 3,
-                              winner: [Int](repeating: 0, count: w * h), confidence: confidence)
-        let critique = FocusStackCritique(coverage: map,
-                                          region: (x: 0.3, y: 0.3, width: 0.4, height: 0.4))
-        XCTAssertTrue(critique.verdicts.contains { if case .gaps = $0 { return true }; return false })
     }
 }

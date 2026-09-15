@@ -520,20 +520,19 @@ final class FocusStackModel: ObservableObject {
                 // twice. Measured on a real subject: 6 steps of depth of field, so an 18-step span
                 // needs ~4 frames where shooting every step was taking 19.
                 let depthOfField = map.depthOfFieldSteps(region: self.subjectRegion)
-                // 95% of it — very nearly the full measured depth of field.
+                // 75% of the measured depth of field.
                 //
-                // The safety margin people expect to need here is already spent twice over inside
-                // the measurement: `depthOfFieldSteps` takes the **lower quartile** of the per-tile
-                // sharp width, so spacing satisfies the narrowest part of the subject rather than
-                // the average one, and it measures that width at 80% of each tile's peak, not at
-                // the point where the tile visibly softens. Discounting the result a further 15%
-                // on top was a third margin stacked on two, and it cost frames on every bracket:
-                // on a real 80-step subject, 85% gave 23 frames where 95% gives 19.
+                // Measured, not chosen. At 95% — spacing equal to the lower quartile — a real stack
+                // came back with **67% coverage**: "33% of the subject was never sharp". The sweep
+                // that planned it logged `lower quartile 5, median 7` and a range covering 95% of
+                // the subject's tiles, so the range was right and the frames were simply too far
+                // apart. That is what spacing *at* the quartile has to mean: the quarter of tiles
+                // whose depth of field is narrower than the quartile gets gaps, and a quarter
+                // predicted is what a third observed looked like.
                 //
-                // 75% was the original figure, set when positioning was open-loop and a frame could
-                // land somewhere other than intended. The bracket now seeks its start by looking,
-                // so that margin insures against a risk that no longer exists.
-                var spacing = depthOfField.map { Swift.max(1, Int((Double($0) * 0.95).rounded())) }
+                // The margin is not redundant with the quartile — it is what covers the tiles below
+                // it. Anything derived from a percentile needs headroom under that percentile.
+                var spacing = depthOfField.map { Swift.max(1, Int((Double($0) * 0.75).rounded())) }
                     ?? FocusOverlap.tightestThatFits(span: span).stepsPerFrame
 
                 // Widen the spacing until the whole range fits in one bracket.
@@ -788,7 +787,12 @@ final class FocusStackModel: ObservableObject {
                 let shares = render.coverage.shares()
                 let covered = render.coverage.coverageFraction(region: region)
                 let dead = shares.filter { $0 < FocusStackCritique.deadFrameShare }.count
-                FileHandle.appendLog("merge: covered \(Int(covered * 100))% of the subject; "
+                // Logged as what it is — the winning frame's average share of the sharpness at
+                // each cell — and never as "how much of the subject came out sharp". It falls as
+                // frames are added, because more frames means more of them are nearly sharp
+                // anywhere, so it reads *worse* on the better stack.
+                FileHandle.appendLog("merge: winner share \(Int(covered * 100))% over the subject "
+                                     + "(falls as frames are added — not a sharpness score); "
                                      + "\(dead) of \(shares.count) frames contributed nothing")
                 FileHandle.appendLog("merge: per-frame share "
                                      + shares.map { "\(Int(($0 * 100).rounded()))%" }.joined(separator: " "))

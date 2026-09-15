@@ -1102,6 +1102,72 @@ samples spent re-photographing one frame) is still caught, a few samples later.
 **Same shape as the pixel-difference failures above:** a threshold calibrated on one regime (frames
 far apart in focus) applied to another (frames a couple of steps apart at the blurred end).
 
+### The coverage score falls as the stack gets better (2026-09-15)
+
+Two brackets of the same subject, minutes apart, one variable changed:
+
+| spacing | frames | "coverage" | measured sharpness |
+|---|---|---|---|
+| 5 | 20 | 67% | baseline |
+| 4 | 24 | 68% | **+14.7% median tile sharpness**, better in 180 of 263 tiles |
+
+`CoverageMap.confidence` is *the winning frame's share of the total sharpness at a cell*. Add frames
+and more of them are nearly sharp anywhere, so every winner's share shrinks — the number is a
+function of frame count as much as of quality, and it rated a visibly and measurably better stack as
+no better. It also told the photographer that **33% of an excellent stack "was never sharp"**,
+advising more frames, which was the very thing they had asked to stop doing.
+
+No threshold fixes this. **A single merge cannot know whether a denser bracket would have been
+sharper**, because the sharpest frame it holds is the only evidence it has. That question is
+answerable by shooting two brackets and comparing them — an A/B, which is how the table above was
+produced — and not otherwise. So `FocusStackCritique` no longer judges coverage at all. It reports
+only what one merge can establish: frames that contributed nothing, and a **range clipped at either
+end**, which *is* visible in one merge because an end frame that keeps winning instead of handing
+over to a neighbour means the subject ran past the bracket.
+
+The number is still logged, labelled as the winner share it is, with the warning that it falls as
+frames are added.
+
+**Spacing stays at 75% of the measured depth of field.** It was briefly raised to 95% on the
+argument that `depthOfFieldSteps` is already conservative (lower quartile, 80% sharpness threshold)
+so the extra margin was a third one stacked on two. The A/B refutes it: 24 frames are measurably
+sharper than 20 on the same subject. The margin is not redundant with the quartile — it is what
+covers the tiles *below* the quartile. **Anything derived from a percentile needs headroom under
+that percentile.**
+
+Note the first diagnosis of the 67% was also wrong, and in an instructive way: the mechanism
+proposed (spacing equal to the lower quartile leaves the narrower quartile of tiles with gaps)
+predicted 25% uncovered against 33% observed, which looked like confirmation. Shooting the control
+showed coverage unmoved at 68%. **A mechanism that predicts the observed number is not thereby
+true** — the control is what tests it.
+
+### Compare merges by measuring them, not by looking (2026-09-15)
+
+The two stacks above are indistinguishable by eye at screen size; the difference is 14.7% in median
+per-tile sharpness. A throwaway `swiftc` tool that loads two TIFFs, computes per-tile Laplacian
+energy on a 24×24 grid inside the subject box and reports better/same/worse tile counts settles in
+seconds what staring cannot settle at all. Tiles with almost no detail in either image are excluded
+— they have no focus to get right and only dilute the comparison.
+
+### Driving the app from outside to run a test (2026-09-15)
+
+The app holds the only camera session, so a test cannot be run by launching a second `gphoto2`. It
+*can* be driven through the accessibility API, which is how the runs above were made:
+
+```
+osascript -e 'tell application "System Events" to tell process "CanonTether" \
+  to click button "Focus Stack" of group 6 of toolbar 1 of window "Canon Tether"'
+osascript -e '… to get {position, size} of image 1 of window "Focus Stacking"'
+screencapture -x -R <x>,<y>,<w>,<h> shot.png      # see what the camera sees
+```
+
+The subject box is a drag, which System Events cannot do — a few lines of `CGEvent` posting
+`leftMouseDown` / interpolated `leftMouseDragged` / `leftMouseUp` does it (a single jump reads as a
+click). `subjectRegion` is not persisted, so a relaunched app has no box and must be redrawn before
+any comparison run, or the scan measures the whole scene and the runs are not comparable.
+
+A rebuilt binary still requires the photographer to quit and relaunch the app.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).
