@@ -1358,6 +1358,33 @@ keeps running through the depth where its pens live.
 useless. When a feature spans a measurement and a decision made from it, check the measurement is
 still collecting where the decision needs to look.
 
+### Stop the sweep by distance travelled, not by a noise threshold (2026-09-15)
+
+Third attempt at the same problem, and the first that is not a threshold on a count.
+
+`risingAgainFraction = 0.15` worked on the recording it was calibrated against and failed on the very
+next run: the same mesh cup measured **16–24%** of box tiles rising again with one box and **9–13%**
+with a slightly larger one, straddling any fixed fraction. The count is a share of the box, and the
+box is drawn by hand, so how much background it includes changes the denominator. The sweep stopped
+at +5 while the pens came sharp at +29.
+
+`minimumTravelPastPeak = 70` instead: the sweep may not declare itself finished until it has
+travelled 70 steps beyond the offset where the scene was sharpest overall. **70 is what the opaque
+subjects already did** — both mask sweeps peak at −21 and stop at +49 — so it costs them nothing,
+while a see-through subject is carried past the depth its contents occupy. Replayed:
+
+    mask   stops +49 (48 of 96 samples) -> -31…+43, 25 frames   [unchanged]
+    cup    runs on through +67          -> -21…+67, 30 frames   [pens covered]
+
+**Every threshold in this feature that counted tiles has eventually broken**, always the same way: a
+number calibrated against one population applied to another (the fixed floor of 3 when the box grew;
+the falloff samples when frames were close together; this one when the box changed shape). A rule
+expressed in the units the sweep actually moves in — focus steps — has no population to drift with.
+
+**Rebuild the harness before believing it.** The run that "passed 15/15" was a stale binary; the
+rebuilt one immediately failed the case whose fixture peaked at offset 0 and never travelled 70
+steps. `swiftc` harnesses are not rebuilt by `swift build`.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).

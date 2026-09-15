@@ -78,17 +78,24 @@ final class FocusSweepMonitorTests: XCTestCase {
         }
     }
 
+    /// Offsets step by 2, as a real sweep does, and run well past the peak: the sweep may not
+    /// finish until it has travelled `minimumTravelPastPeak` beyond the sharpest point, so anything
+    /// behind the subject has had a chance to come into focus.
     func testSubjectThatPeakedAndFellAwayStopsTheSweep() {
         var monitor = FocusSweepMonitor()
         var stop: FocusSweepMonitor.Stop?
-        for offset in 0..<12 where stop == nil {
-            stop = monitor.record(offset: offset, tiles: flat(1), unchanged: false)
+        for step in 0..<12 where stop == nil {
+            stop = monitor.record(offset: step * 2, tiles: flat(1), unchanged: false)
         }
         XCTAssertNil(stop, "a subject still sharp is not stopped on")
-        for offset in 12..<20 where stop == nil {
-            stop = monitor.record(offset: offset, tiles: flat(0.2), unchanged: false)
+        var lastOffset = 0
+        for step in 12..<60 where stop == nil {
+            lastOffset = step * 2
+            stop = monitor.record(offset: lastOffset, tiles: flat(0.2), unchanged: false)
         }
         XCTAssertEqual(stop, .measured)
+        XCTAssertGreaterThanOrEqual(lastOffset, FocusSweepMonitor.minimumTravelPastPeak,
+                                    "only after looking far enough behind the subject")
     }
 
     /// Aggregate sharpness is dominated by whatever is brightest and most textured. A real sweep
@@ -189,9 +196,9 @@ final class FocusSweepMonitorTests: XCTestCase {
     func testAnOpaqueSubjectStillStopsTheSweep() {
         var monitor = FocusSweepMonitor()
         var stop: FocusSweepMonitor.Stop?
-        for offset in 0..<40 where stop == nil {
-            let value = 1.0 - abs(Double(offset) - 4) * 0.12
-            stop = monitor.record(offset: offset, tiles: split(middle: max(value, 0.05), edge: 0.01),
+        for step in 0..<60 where stop == nil {
+            let value = 1.0 - abs(Double(step) - 4) * 0.12
+            stop = monitor.record(offset: step * 2, tiles: split(middle: max(value, 0.05), edge: 0.01),
                                   unchanged: false)
         }
         XCTAssertEqual(stop, .measured, "nothing is coming into focus any more")

@@ -69,6 +69,19 @@ public struct FocusSweepMonitor {
     /// just past focus; a mesh pen cup, whose contents genuinely come into focus behind the wires,
     /// runs 16–24%. 15% separates them with margin on both sides.
     public static let risingAgainFraction = 0.15
+    /// The sweep may not declare itself finished until it has travelled this far past the offset
+    /// where the scene was sharpest overall.
+    ///
+    /// Deterministic, because every noise-threshold version of this failed. Counting tiles that are
+    /// "rising again" works on one recording and not the next: the count is a share of the box, and
+    /// a box drawn with more background around the subject dilutes it — the same mesh cup measured
+    /// 16–24% with one box and 9–13% with a slightly larger one, straddling any fixed fraction.
+    ///
+    /// 70 steps is what the opaque subjects already did: both mask sweeps peaked at −21 and stopped
+    /// at +49. So this costs them nothing, and it carries a see-through subject past the depth where
+    /// its contents live — a mesh pen cup peaking at −27 now reaches +43, and its pens come sharp
+    /// at +29.
+    public static let minimumTravelPastPeak = 70
     /// How much a tile must beat its own best by to count as improving, rather than as noise.
     public static let improvementRatio = 1.05
 
@@ -93,6 +106,8 @@ public struct FocusSweepMonitor {
     private var tileTrough: [Double] = []
     private var tileFloor: [Double] = []
     private var peakValue = 0.0
+    /// Where `peakValue` was seen — the anchor for `minimumTravelPastPeak`.
+    private var peakOffset: Int?
     private var samplesPastPeak = 0
     private var tileBest: [Double] = []
     private var samplesWithoutImprovement = 0
@@ -153,6 +168,7 @@ public struct FocusSweepMonitor {
 
         if total > peakValue {
             peakValue = total
+            peakOffset = offset
             samplesPastPeak = 0
         } else if total < peakValue * Self.falloffFraction {
             samplesPastPeak += 1
@@ -217,7 +233,13 @@ public struct FocusSweepMonitor {
             hasMoved = true
         }
 
+        // Travelled far enough past the sharpest point to have found anything behind the subject?
+        //
+        // The sweep direction is whichever way `offset` is moving; comparing against the peak in
+        // absolute steps works for either, since a sweep only ever travels one way.
+        let travelledPastPeak = peakOffset.map { abs(offset - $0) } ?? 0
         if readings.count >= Self.minimumSamples,
+           travelledPastPeak >= Self.minimumTravelPastPeak,
            samplesPastPeak >= Self.falloffSamples,
            samplesWithoutImprovement >= Self.falloffSamples {
             return .measured
