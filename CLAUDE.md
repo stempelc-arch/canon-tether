@@ -1237,6 +1237,54 @@ count, so a 21-frame stack reported "Merging 1 of 4" and read as though 17 frame
 away. It now reports a percentage. Strip count is an implementation detail of memory management and
 must never appear next to a frame count.
 
+### The download was never slow — the app waited after it (2026-09-15)
+
+`drainDownloadsLocked` was asked for *every frame still outstanding* (21, then 20, …). One shutter
+release produces one file, so that request could never be satisfied: having collected the frame, the
+loop kept polling `wait-event-and-download 600ms` until three empty rounds proved nothing more was
+coming. **1.8s of dead waiting on every frame of every bracket.**
+
+The tell was already in the per-frame timings, and is worth remembering as a diagnostic shape:
+
+    frame 20 took 3.74s (shutter 0.21, download 2.47, focus 1.05)
+    frame 21 took 1.06s (shutter 0.37, download 0.69)
+
+Identical file, identical link, 1.8s apart — exactly 3 × 600ms — because on the last frame the
+remaining count happened to be 1. **When one iteration of a loop is much faster than the rest, the
+difference is the loop's own bookkeeping, not the work.**
+
+It now asks for one frame per shot. The earlier note warning that "exactly one" caused count drift
+still holds and is still handled: the drain keeps *every* filename it sees, so a wait returning two
+loses neither, and the end-of-bracket sweep-up catches anything that missed its window.
+
+Measured on a real 21-frame bracket: **3.9s → 1.85s per frame** (download 2.47 → 0.61), the bracket
+82s → 38s.
+
+### "Still sharpening" must be a share of the subject, not a count (2026-09-15)
+
+Giving the sweep the subject box was necessary and not sufficient — it still ran 190 steps and 96
+samples for a subject occupying 80. Replaying the recorded sweep offline showed why: the
+improving-tile count inside a 306-tile box decays from 306 to about 14 by the point the subject
+ends, then **flickers between 3 and 11 for the remaining travel**, as individual tiles beat their own
+previous best by the 5% margin on noise alone. A fixed floor of 3 is cleared by that flicker at
+almost every sample, so the sweep never stopped.
+
+`improvingTileFraction = 0.03` — 3% of the judged tiles — sits above the flicker and below the real
+signal. Replayed against three recorded sweeps of the same subject it stops at +47/+51/+49, just past
+the subject's far end of +46, using **~48 samples instead of 96** and 93 steps instead of 190, with
+no depth given up.
+
+**A threshold on a count breaks when the population size changes.** The floor of 3 was set when the
+sweep judged the middle of the frame; a photographer-drawn box can hold twice as many tiles, and the
+same number then means something entirely different.
+
+### Replaying a sweep offline needs only two files (2026-09-15)
+
+`GPhotoSession.previewTileSharpness` is `static` and depends on nothing but `ImageThumbnail`, so a
+recorded `Focus Scan` folder can be pushed through the *real* `FocusSweepMonitor` in a `swiftc`
+harness — extract the function, add `FocusDepthMap` and the monitor, and a sweep replays in seconds.
+Both sweep calibrations above were settled that way, against three real recordings, without a camera.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).

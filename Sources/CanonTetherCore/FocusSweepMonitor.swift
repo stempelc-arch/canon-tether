@@ -37,8 +37,20 @@ public struct FocusSweepMonitor {
     public static let endOfTravelSamples = 8
     /// A sweep may not stop itself before this many samples, whatever else it thinks.
     public static let minimumSamples = 12
-    /// More tiles than this reaching a new best means parts of the scene are still coming into focus.
-    public static let improvingTileFloor = 3
+    /// Share of the judged tiles that must reach a new best for the scene to count as still
+    /// sharpening.
+    ///
+    /// A *fraction*, not the fixed count of 3 it replaced. Replayed against a recorded sweep, the
+    /// improving-tile count inside a 306-tile box decays from 306 to about 14 by the point the
+    /// subject ends — and then flickers between 3 and 11 for the rest of the travel, as individual
+    /// tiles beat their own previous best by the 5% margin on noise alone. A fixed floor of 3 is
+    /// cleared by that flicker at almost every sample, so the sweep extended to +145 for a subject
+    /// that ended at +46: 190 steps and 96 samples where 88 steps and 45 would have done.
+    ///
+    /// 3% of the judged tiles sits above the flicker and below the real signal.
+    public static let improvingTileFraction = 0.03
+    /// Never fewer than this, however small the box.
+    public static let improvingTileMinimum = 3
     /// How much a tile must beat its own best by to count as improving, rather than as noise.
     public static let improvementRatio = 1.05
 
@@ -139,7 +151,9 @@ public struct FocusSweepMonitor {
             tileBest[index] = tiles[index]
             improved += 1
         }
-        stillImproving = improved > Self.improvingTileFloor
+        let floor = Swift.max(Self.improvingTileMinimum,
+                              Int(Double(inRegion.count) * Self.improvingTileFraction))
+        stillImproving = improved > floor
         samplesWithoutImprovement = stillImproving ? 0 : samplesWithoutImprovement + 1
 
         // End of travel, guarded twice over.

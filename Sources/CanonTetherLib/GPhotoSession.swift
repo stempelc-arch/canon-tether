@@ -3186,8 +3186,20 @@ actor GPhotoSession {
                 // that frame uncounted, while a wait that returned two had the extra ignored. The
                 // files all reached the folder — the *accounting* was wrong, and the merge was
                 // handed a third of the stack.
+                // Ask for **this** frame, not for every frame still outstanding.
+                //
+                // Passing the whole remaining count meant the drain could never be satisfied: one
+                // shot produces one file, so after collecting it the loop kept polling
+                // `wait-event-and-download 600ms` until three empty rounds proved nothing more was
+                // coming — 1.8s of waiting on every frame of the bracket. The tell was in the
+                // timings: frame 20 downloaded in 2.47s and frame 21, where the remaining count
+                // happened to be 1, downloaded the identical file in 0.69s.
+                //
+                // Every filename the drain sees is still kept, so a wait that hands back two frames
+                // does not lose one — which is what the previous "exactly one" attempt got wrong
+                // and why this reads the count from what arrived rather than from what was asked.
                 captured.append(contentsOf: try await withCommandLock {
-                    await drainDownloadsLocked(expected: plan.frameCount - captured.count)
+                    await drainDownloadsLocked(expected: 1)
                 })
                 let downloadDone = Date()
 
