@@ -1285,6 +1285,53 @@ recorded `Focus Scan` folder can be pushed through the *real* `FocusSweepMonitor
 harness — extract the function, add `FocusDepthMap` and the monitor, and a sweep replays in seconds.
 Both sweep calibrations above were settled that way, against three real recordings, without a camera.
 
+### Seeing *through* a subject: the mesh basket (2026-09-15)
+
+A wire pen cup stacked as its front wires only — mesh sharp, pens inside soft. Six plausible fixes
+were tried and rejected against real recorded sweeps before the actual mechanism turned up:
+
+| attempt | why it failed |
+|---|---|
+| multi-peak at 0.55 share | 20/138 tiles, peaks scattered −1…+103, no coherent surface |
+| finer grid (36/48) | fixes cup, inflates the mask 74 → 102 steps; grid 64 merges everything into one cluster |
+| radial distance from box centre | contents and wall both sit at median 0.81 — no separation |
+| widen past nearest cluster, dropping sweep-edge groups | fixes cup, takes the mask to +117 (50 frames) |
+| enclosure by the front silhouette (primary peaks) | 0% of the cup's deeper tiles are enclosed |
+| shooting wider by default | 50 frames on an opaque subject |
+
+**The contents are not a separate group of tiles — they are a second peak inside the subject's own
+tiles.** A mesh's hard edges carry far more Laplacian energy than anything behind them, so every tile
+covering both peaks on the mesh. Measured on the raw curve over the cup's interior: a single peak at
+−11 decaying monotonically, no bump at +20/+40/+60 at any grid. Yet the sweep frames themselves show
+the pens **sharp at +29**, where the out-of-focus mesh blurs to near-invisibility — the subject was
+photographable all along and the measurement could not represent it.
+
+`FocusDepthMap.depthBehind` therefore asks a different question: among the tiles of the *front
+surface*, how many show a prominent second peak further back? That is also what separates contents
+from background — background is seen **around** an outline, in its own tiles, one peak each;
+contents are seen **through** it, in tiles that belong to the subject. Prominence is measured against
+the valley between the candidate and the global peak, so a shoulder does not count, and a tenth of
+the surface must agree, so a glimpse through a gap does not either.
+
+Validated on four real sweeps:
+
+    mesh cup  -21…+3  (9 frames)  ->  -21…+67  (30 frames)
+    mesh cup  -43…+3 (16 frames)  ->  -43…+21  (22 frames)
+    mask      -31…+43 (25 frames) ->  unchanged
+    mask      -31…+41 (25 frames) ->  unchanged
+
+**The lesson worth keeping: when a measurement cannot see something, check whether the thing is
+visible in the raw frames before rebuilding the measurement.** Five of the six failed attempts were
+rules layered on a signal that was not there; the crop that showed the pens sharp at +29 took a
+minute and pointed straight at the mechanism.
+
+Also: the extension is bounded by how far the sweep looked. The second cup run swept only to +25, so
+its range stops at +21 — correct given the evidence, but short. The sweep's own stop rule and this
+rule want reconciling.
+
+Note `Tests/CanonTetherTests/FocusDepthMapTests.swift` had been committed **empty** and now holds the
+see-through and clustering cases.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).
