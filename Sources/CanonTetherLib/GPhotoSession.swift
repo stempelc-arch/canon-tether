@@ -1104,6 +1104,36 @@ actor GPhotoSession {
     /// working directory never has to change — see `setCaptureDirectory`. Kept out of the capture
     /// folder so a half-written download or a stray preview frame is never visible to the
     /// photographer as if it were a shot.
+    /// Where sweeps and focus maps go: out of the photographer's project, into Caches.
+    ///
+    /// A sweep photographs ~96 frames to measure depth, and a bracket merges a dozen or two of a
+    /// *separate* set. Writing those sweeps beside the photographs put 1,798 files and 240 MB into
+    /// one shooting folder across a day's testing — the app appearing to "capture far more pictures
+    /// than it merges", which is exactly what it looked like. They are diagnostics, not photographs.
+    public static let diagnosticsDirectory: URL = {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return base.appendingPathComponent("CanonTether/focus scans")
+    }()
+
+    /// Sweeps to keep. They exist so a bad result can be replayed offline instead of costing
+    /// another camera run, which is worth real disk — but not unboundedly.
+    public static let retainedScans = 8
+
+    /// Drops all but the newest `retainedScans` sweeps.
+    public static func pruneDiagnostics() {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(at: diagnosticsDirectory,
+                                                        includingPropertiesForKeys: [.contentModificationDateKey],
+                                                        options: [.skipsHiddenFiles]) else { return }
+        let byDate = entries.compactMap { url -> (URL, Date)? in
+            guard let date = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+                .contentModificationDate else { return nil }
+            return (url, date)
+        }.sorted { $0.1 > $1.1 }
+        for (url, _) in byDate.dropFirst(retainedScans) { try? fm.removeItem(at: url) }
+    }
+
     private static let stagingDirectory: URL = {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
@@ -2529,7 +2559,7 @@ actor GPhotoSession {
             throw GPhotoError.commandFailed(capability.explanation ?? "Focus stacking isn't available.")
         }
 
-        let folder = captureDirectory.appendingPathComponent(
+        let folder = Self.diagnosticsDirectory.appendingPathComponent(
             "Focus Map " + DateFormatter.captureFilenameFormatter.string(from: Date()))
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
 

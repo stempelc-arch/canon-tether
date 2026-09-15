@@ -452,9 +452,13 @@ final class FocusStackModel: ObservableObject {
             // investigate was to ask for another camera run — which is what made this feature so
             // slow to get right. 91 small JPEGs cost ~20 MB and turn each run into a dataset that
             // can be replayed offline against any change.
-            let scanFolder = CaptureLocation.directory.appendingPathComponent(
+            // Into Caches, not the project. A sweep is ~96 frames of measurement; putting them
+            // beside the photographs made the app look like it captured far more than it merged,
+            // because in the only place the photographer looks, it did.
+            let scanFolder = GPhotoSession.diagnosticsDirectory.appendingPathComponent(
                 "Focus Scan " + DateFormatter.captureFilenameFormatter.string(from: Date()))
             try? FileManager.default.createDirectory(at: scanFolder, withIntermediateDirectories: true)
+            GPhotoSession.pruneDiagnostics()
 
             var byOffset: [Int: [Double]] = [:]
             var reference: [(offset: Int, tiles: [Double])] = []
@@ -466,7 +470,7 @@ final class FocusStackModel: ObservableObject {
                     reference.append((offset: origin + offset, tiles: tiles))
                 }
             }
-            FileHandle.appendLog("auto-find: sweep saved to \(scanFolder.lastPathComponent)")
+            FileHandle.appendLog("auto-find: sweep saved to \(scanFolder.path)")
             self.sweepReference = reference
             let map = FocusDepthMap(framesByOffset: byOffset)
             FileHandle.appendLog("auto-find: \(byOffset.count) frames, \(map.usableTiles.count) usable tiles, "
