@@ -2890,6 +2890,7 @@ actor GPhotoSession {
     func scanFocus(
         magnitude: Int,
         settleSeconds: Double,
+        region: FocusDepthMap.Region? = nil,
         onProgress: @escaping @Sendable (Int, Int) -> Void
     ) async throws -> (samples: [(offset: Int, frame: Data)], travelled: Int) {
         let capability = await focusDriveCapability()
@@ -2952,7 +2953,7 @@ actor GPhotoSession {
                     /// They used to live inline here, which meant every calibration could only be
                     /// checked by shooting a real sweep and reading the log — and four separate
                     /// misfires reached the photographer that way.
-                    var monitor = FocusSweepMonitor()
+                    var monitor = FocusSweepMonitor(region: region)
                     /// For spotting an end of travel, where consecutive frames are identical.
                     var lastFingerprint: [Float]?
 

@@ -297,7 +297,14 @@ public enum FocusStackRenderer {
                 stripsDone += 1
                 let fraction = 0.5 + 0.45 * Double(stripsDone) / Double(stripRanges.count)
                 progressLock.unlock()
-                progress(fraction, "Merging \(stripsDone) of \(stripRanges.count)…")
+                // Percent, not "x of y".
+                //
+                // This counted *strips* — horizontal bands of the image — directly after a status
+                // line counting frames, so "Merging 1 of 4" right after "21 frames" read as though
+                // the merge had thrown 17 frames away. Strip count is an implementation detail of
+                // how the image is divided for memory, and halving it (512 → 1024 rows) changed
+                // this number for reasons that have nothing to do with the photographer's stack.
+                progress(fraction, "Merging \(Int((Double(stripsDone) / Double(stripRanges.count)) * 100))%…")
                 }
             }
         }

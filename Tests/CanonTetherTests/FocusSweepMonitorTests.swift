@@ -100,13 +100,43 @@ final class FocusSweepMonitorTests: XCTestCase {
         for offset in 0..<12 where stop == nil {
             stop = monitor.record(offset: offset, tiles: split(middle: 1, edge: 0.01), unchanged: false)
         }
-        var edge = 0.01
+        // The middle collapses, taking the aggregate well past falloff, while a handful of tiles
+        // inside the judged area climb on slowly.
+        var climber = 1.1
         for offset in 12..<24 where stop == nil {
-            edge *= 1.5
-            stop = monitor.record(offset: offset, tiles: split(middle: 0.1, edge: edge), unchanged: false)
+            climber *= 1.06
+            var tiles = split(middle: 0.1, edge: 0.01)
+            for k in 0..<5 { tiles[(grid / 2) * grid + grid / 4 + k] = climber }
+            stop = monitor.record(offset: offset, tiles: tiles, unchanged: false)
         }
-        XCTAssertNil(stop, "the aggregate has fallen, but parts of the scene are still coming into focus")
+        XCTAssertNil(stop, "the aggregate has fallen, but parts of the subject are still coming into focus")
         XCTAssertTrue(monitor.stillImproving)
+    }
+
+    /// The sweep's stop rules must use the same box the depth map does.
+    ///
+    /// Judging improvement over the whole frame meant that as focus racked past the subject, the
+    /// background came into focus and the sweep read it as "the subject is still sharpening".
+    /// Measured on a real run: 190 steps of travel and 96 samples for a subject occupying 80 steps
+    /// and 40 samples — 59% of the sweep spent looking past where it needed to.
+    func testImprovementIsJudgedInsideTheSubjectBoxOnly() {
+        let corner = FocusDepthMap.Region(x: 0, y: 0, width: 0.25, height: 0.25)
+        var boxed = FocusSweepMonitor(region: corner)
+        var wholeFrame = FocusSweepMonitor()
+        var background = 0.01
+        for offset in 0..<10 {
+            background *= 1.5
+            var tiles = flat(background)                    // everything outside keeps sharpening
+            for row in 0..<(grid / 4) {
+                for column in 0..<(grid / 4) { tiles[row * grid + column] = 1 }   // static subject
+            }
+            _ = boxed.record(offset: offset, tiles: tiles, unchanged: false)
+            _ = wholeFrame.record(offset: offset, tiles: tiles, unchanged: false)
+        }
+        XCTAssertFalse(boxed.stillImproving,
+                       "a static subject is not 'still sharpening' because the background is")
+        XCTAssertTrue(wholeFrame.stillImproving,
+                      "whole-frame judging is fooled by the background — the behaviour this replaced")
     }
 
     /// A false end of travel truncates the sweep; a false "moved" costs one sample. So an

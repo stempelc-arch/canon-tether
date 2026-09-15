@@ -1212,6 +1212,31 @@ costing ~6s and bounding the peak.
 **A benchmark that only reports wall time hides this entirely.** `/usr/bin/time -l` and its
 `maximum resident set size` is what turned a pure speed win into a portability fix.
 
+### The sweep must judge the SUBJECT, not the frame (2026-09-15)
+
+Measured on a real run: the sweep travelled **190 steps taking 96 samples**, for a subject that
+occupied **80 steps and 40 of them**. 59% of a 46-second sweep was spent looking past where it
+needed to.
+
+The extension loop keeps going while tiles are still reaching new bests — but that was counted over
+the **whole frame**, while the depth map that follows honours the drawn box. So as focus racked past
+the subject, the *background* came into focus, the sweep read it as "the subject is still
+sharpening", and extended: out to +145 for a subject that ended at +46. `FocusSweepMonitor` now
+takes the `Region` and judges both the aggregate and the improving-tile count inside it, using
+`Region.contains` so the two cannot drift apart.
+
+**Fourth instance of the same error shape** (see the 5× magnification note above): a subsystem given
+a region of interest, with one stage still working on the whole frame. When something is measured
+against a box, check *every* stage that reads pixels.
+
+### "Merging 1 of 4" is not four frames (2026-09-15)
+
+The merge progress counted **strips** — horizontal bands the image is divided into for memory —
+directly beneath a status line counting frames. Raising `stripRows` 512 → 1024 halved the strip
+count, so a 21-frame stack reported "Merging 1 of 4" and read as though 17 frames had been thrown
+away. It now reports a percentage. Strip count is an implementation detail of memory management and
+must never appear next to a frame count.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).

@@ -431,7 +431,12 @@ final class FocusStackModel: ObservableObject {
             var frames: [(offset: Int, frame: Data)] = []
             var travelled = 0
             do {
-                let result = try await session.scanFocus(magnitude: magnitude, settleSeconds: settle) { stop, total in
+                // The sweep judges "is the subject still sharpening?" over the same box the depth
+                // map uses. Without it, background coming into focus kept the sweep extending well
+                // past the subject — 190 steps of travel for a subject occupying 80.
+                let result = try await session.scanFocus(magnitude: magnitude,
+                                                         settleSeconds: settle,
+                                                         region: self.subjectRegion) { stop, total in
                     Task { @MainActor in self.scanProgress = "Sweeping \(stop) of \(total)…" }
                 }
                 frames = result.samples
