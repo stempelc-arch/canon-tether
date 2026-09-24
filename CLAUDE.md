@@ -1385,6 +1385,38 @@ expressed in the units the sweep actually moves in — focus steps — has no po
 rebuilt one immediately failed the case whose fixture peaked at offset 0 and never travelled 70
 steps. `swiftc` harnesses are not rebuilt by `swift build`.
 
+### The merge was softer than its own frames — bilinear resampling (2026-09-16)
+
+Reported as "softness in the middle of the subject, merge or camera?". Measured, per tile, against
+the sharpest value any frame achieved there:
+
+    bilinear + align   median merged/best 0.833   72 of 130 detailed tiles >15% soft
+    alignment disabled                    0.894   48
+    bicubic  + align                      0.886   49
+
+So the sharp data was in the frames and the merge was losing it — a merge problem, not the camera.
+
+**Every frame except the alignment reference is resampled, and bilinear is a half-pixel low-pass.**
+That also explains an oddity visible in every bracket's `per-frame share` line, where one mid-bracket
+frame wins 20–24% of the image while its neighbours win 3–5%: that frame is the reference, the only
+one never resampled, so it genuinely is the sharpest thing the merge is offered.
+
+Disabling alignment scored *better* and is still wrong — focus breathing here is **real**, measured at
+1.2% across a bracket, with the chained estimate (1.01106) and a direct first-to-last estimate
+(1.01215) agreeing closely. Per-tile sharpness cannot tell "sharp" from "sharp but doubled", so a
+misregistered merge can measure well. The answer is a better resampler, not skipping the warp.
+
+`readWarpedBand` now uses Catmull-Rom bicubic. On the opaque subject too: 0.780 → 0.879 median, soft
+tiles 105 → 78. Cost is 37s → 46s on a 14-frame merge.
+
+**The 4×4 taps are not what costs the time — allocation is.** The first version built two `[Float]`
+arrays of weights and two of clamped indices per *pixel*, and took the merge from 37s to 84s. Held in
+scalars it is 46s, a 23% cost for the quality.
+
+Note this **supersedes the byte-identical checksum baseline** recorded above: the merge output changes
+by design here. The technique still applies to future refactors — re-baseline the checksum after an
+intentional change and keep comparing against it.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).

@@ -536,9 +536,9 @@ struct ScratchPlane {
         let centerX = Double(width - 1) / 2, centerY = Double(fullHeight - 1) / 2
         let topSource = transform.source(x: 0, y: Double(rows.lowerBound), centerX: centerX, centerY: centerY).y
         let bottomSource = transform.source(x: 0, y: Double(rows.upperBound - 1), centerX: centerX, centerY: centerY).y
-        // One row of margin each side for the bilinear tap.
-        let firstRow = max(0, Int(min(topSource, bottomSource).rounded(.down)) - 1)
-        let lastRow = min(height - 1, Int(max(topSource, bottomSource).rounded(.up)) + 1)
+        // Two rows of margin each side for the bicubic tap.
+        let firstRow = max(0, Int(min(topSource, bottomSource).rounded(.down)) - 2)
+        let lastRow = min(height - 1, Int(max(topSource, bottomSource).rounded(.up)) + 2)
         guard firstRow <= lastRow else {
             return StackImage(width: width, height: rows.count, channels: ScratchPlane.channels)
         }
@@ -566,19 +566,51 @@ struct ScratchPlane {
                 let sx = min(max(p.x, 0), Double(width - 1))
                 let sy = min(max(p.y - Double(firstRow), 0), Double(sourceRows - 1))
                 let x0 = Int(sx.rounded(.down)), y0 = Int(sy.rounded(.down))
-                let x1 = min(x0 + 1, width - 1), y1 = min(y0 + 1, sourceRows - 1)
                 let fx = Float(sx - Double(x0)), fy = Float(sy - Double(y0))
-                let i00 = (y0 * width + x0) * c, i10 = (y0 * width + x1) * c
-                let i01 = (y1 * width + x0) * c, i11 = (y1 * width + x1) * c
+                let (wx0, wx1, wx2, wx3) = Self.cubicWeights(fx)
+                let (wy0, wy1, wy2, wy3) = Self.cubicWeights(fy)
                 let d = (r * width + x) * c
+                // The 4x4 neighbourhood, clamped at the edges. Held in scalars rather than arrays:
+                // this is the innermost loop of the warp, and allocating two small arrays per pixel
+                // cost more than the extra taps — it took the merge from 37s to 84s.
+                let cx0 = min(max(x0 - 1, 0), width - 1), cx1 = min(max(x0, 0), width - 1)
+                let cx2 = min(max(x0 + 1, 0), width - 1), cx3 = min(max(x0 + 2, 0), width - 1)
+                let ry0 = min(max(y0 - 1, 0), sourceRows - 1), ry1 = min(max(y0, 0), sourceRows - 1)
+                let ry2 = min(max(y0 + 1, 0), sourceRows - 1), ry3 = min(max(y0 + 2, 0), sourceRows - 1)
                 for ch in 0..<c {
-                    let top = source.data[i00 + ch] * (1 - fx) + source.data[i10 + ch] * fx
-                    let bottom = source.data[i01 + ch] * (1 - fx) + source.data[i11 + ch] * fx
-                    out.data[d + ch] = top * (1 - fy) + bottom * fy
+                    @inline(__always) func row(_ y: Int) -> Float {
+                        let base = y * width
+                        return wx0 * source.data[(base + cx0) * c + ch]
+                             + wx1 * source.data[(base + cx1) * c + ch]
+                             + wx2 * source.data[(base + cx2) * c + ch]
+                             + wx3 * source.data[(base + cx3) * c + ch]
+                    }
+                    out.data[d + ch] = wy0 * row(ry0) + wy1 * row(ry1) + wy2 * row(ry2) + wy3 * row(ry3)
                 }
             }
         }
         return out
+    }
+
+    /// Catmull-Rom weights for one axis.
+    ///
+    /// Bicubic rather than bilinear because **every frame but the alignment reference is resampled**,
+    /// and bilinear is a half-pixel low-pass: measured on a real 14-frame bracket, the merged image
+    /// was softer than the sharpest available frame in 72 of 130 detailed tiles, median 0.833 of
+    /// best. It also explains the recurring oddity where one mid-bracket frame wins 20–24% of the
+    /// image while its neighbours win 3–5% — that frame is the reference, the only one never
+    /// resampled, so it is genuinely the sharpest thing the merge is offered.
+    ///
+    /// Focus breathing here is real and must still be corrected — measured 1.2% across a bracket,
+    /// agreeing to 0.001 between the chained estimate and a direct first-to-last one — so the answer
+    /// is a better resampler, not skipping the warp.
+    @inline(__always)
+    static func cubicWeights(_ t: Float) -> (Float, Float, Float, Float) {
+        let t2 = t * t, t3 = t2 * t
+        return (-0.5 * t3 + t2 - 0.5 * t,
+                 1.5 * t3 - 2.5 * t2 + 1,
+                -1.5 * t3 + 2 * t2 + 0.5 * t,
+                 0.5 * t3 - 0.5 * t2)
     }
 
     /// Draws a `CGImage` into a float `StackImage` — the small-preview path, where a whole-image
