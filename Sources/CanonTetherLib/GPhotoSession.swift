@@ -1223,6 +1223,50 @@ actor GPhotoSession {
     /// Moves a freshly downloaded camera file (e.g. "capt0000.cr2") out of the shell's cwd to a
     /// stable, sortable, collision-free name and notifies listeners via `captureStream`.
     @discardableResult
+    /// Copies a capture to every backup drive, off the capture path.
+    ///
+    /// Detached on purpose. The copies are blocking file IO onto drives that may be slow, sleeping
+    /// or absent, and this runs inside the session actor, which the tether watch and every camera
+    /// command also need — waiting on a USB drive here would stall the next frame. The shot is
+    /// already safe in the project folder by the time this starts, so the backup is allowed to take
+    /// its time and to fail without touching the shoot.
+    private func mirrorToBackups(_ file: URL) {
+        let destinations = BackupSettings.load()
+        guard !destinations.isEmpty else { return }
+        let project = captureDirectory
+        Task.detached(priority: .utility) { [weak self] in
+            let outcomes = await CaptureBackup.mirror(file, inProjectAt: project, to: destinations)
+            await self?.reportBackup(outcomes, for: file)
+        }
+    }
+
+    /// Logs every result and surfaces only what the photographer has to act on.
+    private func reportBackup(_ outcomes: [CaptureBackup.Outcome], for file: URL) {
+        for outcome in outcomes {
+            switch outcome.result {
+            case .copied(let bytes):
+                log("backup: \(file.lastPathComponent) -> \(outcome.destination.label) (\(bytes) bytes)")
+            case .skipped(let reason):
+                log("backup: \(outcome.destination.label) skipped — \(reason == .notMounted ? "not mounted" : "already there")")
+            case .failed(let message):
+                log("backup: \(outcome.destination.label) FAILED — \(message)")
+            }
+        }
+        // Only once per run of trouble: a drive that is unplugged is unplugged for every frame, and
+        // repeating the same warning on every shot buries the status pill in noise.
+        if let warning = CaptureBackup.warning(for: outcomes) {
+            if warning != lastBackupWarning {
+                lastBackupWarning = warning
+                status(warning)
+            }
+        } else {
+            lastBackupWarning = nil
+        }
+    }
+
+    /// The last warning shown, so a drive that stays unplugged doesn't re-warn per frame.
+    private var lastBackupWarning: String?
+
     private func importDownloaded(_ downloadedName: String) -> URL? {
         // A live-view frame must never enter the gallery. This is reachable on an ordinary path:
         // pressing the shutter during live view cancels a `capture-preview` mid-flight, so the
@@ -1264,6 +1308,7 @@ actor GPhotoSession {
             return nil
         }
         log("downloaded \(finalURL.lastPathComponent)")
+        mirrorToBackups(finalURL)
         // Bracket frames are deliberately not published to the gallery: the merged TIFF is what the
         // photographer reviews, and it is registered separately once the merge finishes. They are
         // still returned to the caller, which is how the bracket collects its own frames.

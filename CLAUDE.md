@@ -1417,6 +1417,46 @@ Note this **supersedes the byte-identical checksum baseline** recorded above: th
 by design here. The technique still applies to future refactors — re-baseline the checksum after an
 intentional change and keep comparing against it.
 
+## Backup: every capture to more than one disk (2026-09-28)
+
+Until this, a frame landed in exactly one folder on one drive — and on a tethered shoot the camera
+often isn't writing a card either, so for a stretch of time the only copy of a client's session was
+on a single disk. It was the one failure in this app that loses work rather than costing time.
+
+`CaptureBackup` (Core, Foundation-only so the tests run in CI) mirrors each capture to a list of
+destinations **concurrently**, because the drives are independent and writing to three in series
+makes a shoot three times as slow to reach safety. The standard shape is the working copy on the
+internal disk plus two separate externals; nothing limits the count.
+
+- **An absent destination root is never created.** This is the trap the design exists around: when
+  an external unmounts, its `/Volumes/<name>` folder simply disappears, and creating directories
+  along that path writes to the **boot disk** instead — silently filling the startup volume with
+  what looks like a successful backup, somewhere nobody will look. A missing root is `.notMounted`.
+- **Copies are verified by size**, and a short file is deleted rather than left looking finished. A
+  copy onto a full disk, or a drive pulled mid-write, leaves a truncated file and no error worth
+  trusting. Size rather than a checksum deliberately: it catches the failures that actually occur
+  here for the cost of a `stat`, where hashing every frame means reading it back off every drive.
+- **An identical copy already present is skipped**, so a drive plugged back in mid-shoot catches up
+  without re-copying, while a *different*-sized one is replaced as a failed earlier attempt.
+- **Failures never propagate.** A backup drive that has been unplugged must not break the shoot; the
+  photographer is told, not stopped. The warning names the drive — "backup failed" with no name
+  leaves them unable to act without digging through a log mid-shoot — and repeats only when it
+  changes, since an unplugged drive is unplugged for every frame.
+
+The copy runs **detached from the session actor** (`mirrorToBackups`). The actor is what the tether
+watch and every camera command need; blocking it on a sleeping USB drive would stall the next frame.
+The shot is already safe in the project folder before this starts, so the backup can take its time.
+
+Layout under each root is `<project folder>/<any subfolder>/<file>`, keeping the project's own name
+so one external can hold several shoots and a restore is a drag rather than a reconstruction.
+
+Destinations live in `BackupSettings` as **plain paths, not security-scoped bookmarks** — this app is
+deliberately unsigned and unsandboxed, and a path is what it can actually reopen next launch.
+Preferences → Backup Drives shows each one's connected state as the list is drawn.
+
+Covered by `Tests/CanonTetherTests/CaptureBackupTests.swift` and two `swiftc` harnesses (16 checks on
+the engine including the `/Volumes` trap, 6 on settings persistence).
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).

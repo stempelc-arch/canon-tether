@@ -1133,6 +1133,7 @@ private struct PreferencesView: View {
     @AppStorage("focusCheckEnabled") private var focusEnabled = true
     @AppStorage("exposureCheckEnabled") private var exposureEnabled = true
     @AppStorage("checkForUpdates") private var updatesEnabled = true
+    @State private var backups: [CaptureBackup.Destination] = BackupSettings.load()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -1156,6 +1157,42 @@ private struct PreferencesView: View {
                     .font(.caption)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // Grouped so the VStack stays within SwiftUI's ten-child builder limit.
+            Group {
+                Divider()
+
+                // Backup drives
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Backup Drives").font(.headline)
+                    ForEach(backups) { destination in
+                        HStack(spacing: 8) {
+                            // Connected or not, checked as the list is drawn: an external that has been
+                            // unplugged is the normal case, not an error, and the photographer needs to
+                            // see it here rather than discover it from a warning mid-shoot.
+                            Image(systemName: isConnected(destination) ? "externaldrive.fill.badge.checkmark"
+                                                                       : "externaldrive.badge.xmark")
+                                .foregroundStyle(isConnected(destination) ? Color.green : Color.orange)
+                                .help(isConnected(destination) ? "Connected" : "Not connected — copies to this drive are skipped")
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(destination.label).font(.callout)
+                                Text(destination.root.path)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            Button("Remove") { remove(destination) }
+                        }
+                    }
+                    Button("Add Drive…") { addBackup() }
+                    Text(backupExplanation)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             Divider()
@@ -1245,6 +1282,45 @@ private struct PreferencesView: View {
         }
         if updateChecker.lastCheckFailed { return "Couldn't reach the update server." }
         return "You're on version \(UpdateChecker.currentVersion), the latest."
+    }
+
+    private func isConnected(_ destination: CaptureBackup.Destination) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: destination.root.path, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+    }
+
+    private var backupExplanation: String {
+        switch backups.count {
+        case 0:
+            return "Every shot is written here as it lands, as well as to the capture folder. With none set, the only copy of a shoot is on this Mac. Standard practice is two separate external drives."
+        case 1:
+            return "Shots are copied here as they land. One more external drive would match standard practice — two backups plus the working copy on this Mac."
+        default:
+            return "Shots are written to all of these as they land, at the same time as the capture folder. A drive that isn't connected is skipped and reported; plug it back in and the next shots resume copying to it."
+        }
+    }
+
+    private func addBackup() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Use for Backup"
+        panel.message = "Choose a folder on a backup drive"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let resolved = url.resolvingSymlinksInPath()
+        // Backing up into the capture folder is not a backup — it is the same disk and, if nested,
+        // the same folder tree the app is writing into.
+        guard resolved != CaptureLocation.directory else { return }
+        guard !backups.contains(where: { $0.root == resolved }) else { return }
+        backups.append(CaptureBackup.Destination(root: resolved, label: BackupSettings.label(for: resolved)))
+        BackupSettings.save(backups)
+    }
+
+    private func remove(_ destination: CaptureBackup.Destination) {
+        backups.removeAll { $0.id == destination.id }
+        BackupSettings.save(backups)
     }
 
     private func chooseFolder() {
