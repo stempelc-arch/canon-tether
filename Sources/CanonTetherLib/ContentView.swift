@@ -70,51 +70,38 @@ public struct ContentView: View {
         .task { await updateChecker.checkInBackground() }
     }
 
+    /// Divides the toolbar's groups.
+    ///
+    /// A plain `Divider()` renders in a toolbar as a very short, very faint dash — close to
+    /// invisible against a dark toolbar, which defeats the point of grouping the controls at all.
+    /// This is drawn explicitly: the height of the icon row, and a weight that reads as a
+    /// deliberate boundary rather than an artefact.
+    ///
+    /// Pure SwiftUI shapes, deliberately — an AppKit-backed control pinned below its intrinsic
+    /// size is the `SIGILL` trap documented in CLAUDE.md, and a separator is exactly the sort of
+    /// thing one is tempted to force to a small fixed height.
+    private var toolbarSeparator: some View {
+        RoundedRectangle(cornerRadius: 1)
+            .fill(Color.primary.opacity(0.28))
+            .frame(width: 2, height: 22)
+            .padding(.horizontal, 7)
+            .accessibilityHidden(true)
+    }
+
     @ToolbarContentBuilder
     private var presenterToolbar: some ToolbarContent {
-        ToolbarItem(placement: .principal) {
-            Picker("Client shows", selection: $reviewModel.mode) {
-                ForEach(ReviewMode.allCases) { mode in
-                    Label(mode.label, systemImage: mode.symbol).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .help("Choose what the client monitor displays")
-        }
+        // Grouped by what the control *acts on*, left to right: the camera, then the client
+        // monitor in the centre, then this session's shots, then the app itself. Before, the nine
+        // items sat in one undifferentiated row with related ones far apart — the client-monitor
+        // mode picker was at the far left while the button that opens the client screen was five
+        // icons away, next to Focus Stack.
+        //
+        // Everything stays in `.primaryAction` and `.principal`. Those are the two placements that
+        // do not collapse into the overflow chevron, and a shooting control you have to go hunting
+        // for is useless — which is how Live View came to be hidden once already.
 
-        ToolbarItem {
-            Menu {
-                Picker("Interval", selection: $reviewModel.slideshowInterval) {
-                    Text("2 seconds").tag(2.0)
-                    Text("3 seconds").tag(3.0)
-                    Text("4 seconds").tag(4.0)
-                    Text("6 seconds").tag(6.0)
-                    Text("10 seconds").tag(10.0)
-                }
-            } label: {
-                Label("Slideshow speed", systemImage: "timer")
-            }
-            .help("Slideshow interval")
-        }
-
-        ToolbarItem {
-            Button {
-                showingOnlyGood.toggle()
-                if showingOnlyGood {
-                    Task { await analysis.analyzeAll(viewModel.captures) }
-                }
-            } label: {
-                Label("Show Good Shots Only", systemImage: showingOnlyGood ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
-                    .foregroundStyle(showingOnlyGood ? Color.green : Color.primary)
-            }
-            .help(showingOnlyGood
-                  ? "Hiding soft-focus or bad-exposure shots — click to show everything"
-                  : "Filter the filmstrip to sharp, well-exposed shots, to flag picks faster")
-        }
-
-        // .primaryAction so it can't end up collapsed into the toolbar's overflow chevron — this
-        // is a shooting control, and a composing aid you have to go hunting for is useless.
-        ToolbarItem(placement: .primaryAction) {
+        // MARK: The camera
+        ToolbarItemGroup(placement: .primaryAction) {
             Button {
                 viewModel.toggleLiveView()
             } label: {
@@ -129,9 +116,30 @@ public struct ContentView: View {
             // routinely, and gating both directions left the canvas stuck on a frozen frame with
             // the only way back to reviewing shots greyed out.
             .disabled(!viewModel.isConnected && !viewModel.isLiveViewOn)
+
+            Button {
+                focusStackWindow.toggle(viewModel: viewModel)
+            } label: {
+                Label("Focus Stack", systemImage: "camera.metering.center.weighted")
+            }
+            .help("Shoot a focus bracket and merge it into one all-in-focus image")
+            .disabled(!viewModel.isConnected)
+
+            toolbarSeparator
         }
 
-        ToolbarItem(placement: .primaryAction) {
+        // MARK: What the client sees
+        ToolbarItem(placement: .principal) {
+            Picker("Client shows", selection: $reviewModel.mode) {
+                ForEach(ReviewMode.allCases) { mode in
+                    Label(mode.label, systemImage: mode.symbol).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .help("Choose what the client monitor displays")
+        }
+
+        ToolbarItemGroup(placement: .primaryAction) {
             Button {
                 reviewWindow.toggle(viewModel: viewModel, reviewModel: reviewModel)
             } label: {
@@ -142,28 +150,66 @@ public struct ContentView: View {
                   ? "Client screen is on — click to turn it off (⌘R)"
                   : "Show the client screen, full-screen on the other monitor (⌘R)")
             .keyboardShortcut("r", modifiers: .command)
-        }
 
-        ToolbarItem {
-            Button {
-                focusStackWindow.toggle(viewModel: viewModel)
-            } label: {
-                Label("Focus Stack", systemImage: "camera.metering.center.weighted")
+            // Only while the client monitor is actually running a slideshow. A speed control for
+            // something that is not playing is a permanent slot spent on nothing.
+            if reviewModel.mode == .slideshow {
+                Menu {
+                    Picker("Interval", selection: $reviewModel.slideshowInterval) {
+                        Text("2 seconds").tag(2.0)
+                        Text("3 seconds").tag(3.0)
+                        Text("4 seconds").tag(4.0)
+                        Text("6 seconds").tag(6.0)
+                        Text("10 seconds").tag(10.0)
+                    }
+                } label: {
+                    Label("Slideshow speed", systemImage: "timer")
+                }
+                .help("How long each shot stays on the client screen")
             }
-            .help("Shoot a focus bracket and merge it into one all-in-focus image")
-            .disabled(!viewModel.isConnected)
+
+            toolbarSeparator
         }
 
-        ToolbarItem {
+        // MARK: This session's shots
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button {
+                showingOnlyGood.toggle()
+                if showingOnlyGood {
+                    Task { await analysis.analyzeAll(viewModel.captures) }
+                }
+            } label: {
+                Label("Show Good Shots Only",
+                      systemImage: showingOnlyGood ? "line.3.horizontal.decrease.circle.fill"
+                                                   : "line.3.horizontal.decrease.circle")
+                    .foregroundStyle(showingOnlyGood ? Color.green : Color.primary)
+            }
+            .help(showingOnlyGood
+                  ? "Hiding soft-focus or bad-exposure shots — click to show everything"
+                  : "Filter the filmstrip to sharp, well-exposed shots, to flag picks faster")
+
+            Button {
+                viewModel.exportPicks(reviewModel.flaggedOrdered(in: viewModel.captures))
+            } label: {
+                Label("Export Flagged", systemImage: "square.and.arrow.up")
+            }
+            .help("Copy the flagged picks to a folder")
+            // Just the emptiness check — building the full ordered list (filter + reverse over
+            // every capture) twice per render was measurable steady-state work on big sessions.
+            .disabled(reviewModel.flagged.isEmpty)
+
+            toolbarSeparator
+        }
+
+        // MARK: The app
+        ToolbarItemGroup(placement: .primaryAction) {
             CoffeeButton(isOn: sleepPreventer.isPreventingSleep) {
                 sleepPreventer.toggle()
             }
             .help(sleepPreventer.isPreventingSleep
                   ? "Preventing sleep — click to allow the Mac to sleep again"
                   : "Keep the Mac awake during the session")
-        }
 
-        ToolbarItem {
             Button {
                 showingPreferences = true
             } label: {
@@ -183,18 +229,6 @@ public struct ContentView: View {
             .help(updateChecker.availableVersion.map { "Preferences (⌘,) — version \($0) is available" }
                   ?? "Preferences (⌘,)")
             .keyboardShortcut(",", modifiers: .command)
-        }
-
-        ToolbarItem {
-            Button {
-                viewModel.exportPicks(reviewModel.flaggedOrdered(in: viewModel.captures))
-            } label: {
-                Label("Export Flagged", systemImage: "square.and.arrow.up")
-            }
-            .help("Copy the flagged picks to a folder")
-            // Just the emptiness check — building the full ordered list (filter + reverse over
-            // every capture) twice per render was measurable steady-state work on big sessions.
-            .disabled(reviewModel.flagged.isEmpty)
         }
     }
 
