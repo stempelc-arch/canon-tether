@@ -1562,6 +1562,50 @@ default tone curve is doing the lifting in the usual path. That is correct for m
 merge wants scene light, not a rendering — but it means linear values read lower than intuition
 suggests, and 0.11 is a dim scene rather than a broken decode.
 
+### The merge had no photographic rendering, and looked terrible (2026-09-29)
+
+The first working HDR output was correct and ugly. Measured against an ordinary conversion of the
+same frame:
+
+    wall (unclipped)   merged 39.5 27.7 19.6   normal 34.1 19.2  6.6
+    plant (shadow)     merged 13.5 16.4 17.4   normal  5.4  8.0  8.8
+
+Shadows more than twice as bright, blue three times too high — flat, washed and cold. The cause:
+`CIRAWFilter` with `boostAmount = 0` was used to get *scene-linear* data for merging, which is right,
+and then the result was encoded straight to sRGB — which has no toe and no colour rendering. **The
+camera's rendering was removed for measurement and never put back.**
+
+`HDRToneCurve` learns it instead of inventing it: the reference frame is decoded twice, linear and as
+normally rendered, and the transfer between them is built per channel from millions of paired
+samples. Three attempts were needed to make it work, and the failures are the useful part:
+
+- **Render first, then fit highlights above white — impossible.** An ordinary rendering already
+  reaches display white at linear 1.0, so there is no headroom left. Every recovered highlight
+  collapsed onto white, and because the three channels reach white at slightly different points, a
+  recovered sky came back **cyan**. Compression has to happen in *scene* terms, before the
+  rendering, which is also what a photographer does: pull the highlights down, then develop.
+- **An asymptotic knee does not give separation.** Folding everything above a knee into the band
+  below 1.0 left a sky at 0.958 linear, which an ordinary rendering maps to white anyway. Showing
+  recovered detail means rendering it *darker than white*; there is no way around spending display
+  range on it. The compression is now extended Reinhard anchored to a measured `sceneWhite` (a 99.9th
+  percentile from a 600 px trial merge — the maximum would let one specular glint darken the whole
+  picture).
+- **Handing over to the extension at saturation made it mottled.** The learned curve saturates within
+  a few bins of the top, so a ramp from there to white was extremely steep and amplified tiny
+  differences into blotches: a sky that is provably clean in the source frame came back speckled.
+  The handover is now at `holdBelow = 0.6` of the rendered maximum, spreading the whole remaining
+  input range across the whole remaining display range, which is gentle by construction.
+
+**Verify a colour complaint against the source before blaming the pipeline.** The strong cyan through
+the window looked like a merge bug and is real: the dark frame, correctly exposed for the window and
+normally rendered, reads 18.9/96.2/188.2 there. The camera's white balance is set for the tungsten
+interior, so the daylight outside genuinely is that blue.
+
+Still imperfect: speckle remains in the *brightest* part of a recovered sky, where the tone curve is
+steepest and the darkest frame's own noise is amplified by the 16x exposure scaling. Next thing to
+try is weighting by noise as well as well-exposedness, so a bright region prefers the frame that
+photographed it at a higher signal level.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).

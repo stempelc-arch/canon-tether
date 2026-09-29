@@ -76,6 +76,27 @@ enum HDRRenderer {
             throw RenderError.sizeMismatch
         }
 
+        // Learn the rendering from the reference frame itself.
+        //
+        // Merging happens in linear light, but linear encoded straight to sRGB is not a photograph:
+        // no toe, no colour rendering — measured against a normal conversion, shadows came out more
+        // than twice as bright and the blue channel three times too high. Rendering the *same*
+        // frame both ways and building the transfer between them means the merged picture matches
+        // an ordinary conversion of the metered exposure, and differs only where the bracket
+        // actually added something.
+        var toneCurve = try learnedToneCurve(from: urls[min(max(referenceIndex, 0), urls.count - 1)],
+                                             context: context, linearSpace: linearSpace)
+        // How bright the scene actually gets, measured on a small merge before committing to the
+        // full one. The compression is anchored to this so the brightest recovered detail lands at
+        // white; guessing it from the darkest frame's exposure instead would anchor to the range
+        // the bracket *could* have reached rather than the range the scene actually used, and throw
+        // away contrast on every ordinary subject.
+        toneCurve.sceneWhite = try sceneWhite(images: images, exposures: exposures,
+                                              reference: min(max(referenceIndex, 0), urls.count - 1),
+                                              context: context, linearSpace: linearSpace)
+        FileHandle.appendLog(String(format: "hdr: scene white %.2f (%.2f stops above the metered frame)",
+                                    toneCurve.sceneWhite, log2(Double(max(toneCurve.sceneWhite, 1)))))
+
         let extent = images[0].extent
         let width = Int(extent.width), height = Int(extent.height)
         let channels = 3
@@ -119,7 +140,7 @@ enum HDRRenderer {
 
             let radiance = try HDRMerge.radiance(from: frames, reference: reference)
             peakRadiance.append(contentsOf: radiance.data.filter { $0 > 1 })
-            let shown = HDRMerge.render(radiance)
+            let shown = toneCurve.render(radiance)
             for i in 0..<(width * rows * channels) {
                 output[row * width * channels + i] = UInt16(min(max(shown.data[i], 0), 1) * 65535)
             }
@@ -137,6 +158,94 @@ enum HDRRenderer {
         return Render(outputURL: outputURL,
                       sourceCount: urls.count,
                       recoveredStops: peakRadiance.isEmpty ? 0 : HDRMerge.recoveredStops(recovered))
+    }
+
+    /// The brightest radiance worth rendering as white, from a low-resolution merge.
+    ///
+    /// A high percentile rather than the maximum: a single specular glint would otherwise set the
+    /// anchor and darken the entire picture to accommodate one pixel nobody looks at.
+    private static func sceneWhite(images: [CIImage],
+                                   exposures: [Double],
+                                   reference: Int,
+                                   context: CIContext,
+                                   linearSpace: CGColorSpace) throws -> Float {
+        let edge: CGFloat = 600
+        let scale = edge / images[0].extent.width
+        var frames: [HDRMerge.Frame] = []
+        for (index, image) in images.enumerated() {
+            let small = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            let w = Int(small.extent.width), h = Int(small.extent.height)
+            guard w > 0, h > 0 else { throw RenderError.decodeFailed(URL(fileURLWithPath: "/"))}
+            var buffer = [Float](repeating: 0, count: w * h * 4)
+            buffer.withUnsafeMutableBytes { raw in
+                context.render(small, toBitmap: raw.baseAddress!, rowBytes: w * 16,
+                               bounds: small.extent, format: .RGBAf, colorSpace: linearSpace)
+            }
+            var strip = StackImage(width: w, height: h, channels: 3)
+            for pixel in 0..<(w * h) {
+                strip.data[pixel * 3 + 0] = buffer[pixel * 4 + 0]
+                strip.data[pixel * 3 + 1] = buffer[pixel * 4 + 1]
+                strip.data[pixel * 3 + 2] = buffer[pixel * 4 + 2]
+            }
+            frames.append(HDRMerge.Frame(image: strip, exposure: exposures[index]))
+        }
+        let radiance = try HDRMerge.radiance(from: frames, reference: reference)
+        var values = radiance.data.filter { $0.isFinite && $0 > 0 }
+        guard !values.isEmpty else { return 1 }
+        values.sort()
+        let percentile = values[Int(Double(values.count) * 0.999)]
+        // Never below 1: a scene that fitted in one exposure must render exactly as that exposure
+        // did, with no compression at all.
+        return Swift.max(percentile, 1)
+    }
+
+    /// Samples the reference frame rendered two ways and builds the transfer between them.
+    ///
+    /// Done at low resolution on purpose: the curve is a statistical summary over millions of
+    /// samples either way, and a full-size second decode would double the slowest part of the merge
+    /// for no additional accuracy.
+    private static func learnedToneCurve(from url: URL,
+                                         context: CIContext,
+                                         linearSpace: CGColorSpace) throws -> HDRToneCurve {
+        guard let linearFilter = CIRAWFilter(imageURL: url),
+              let renderedFilter = CIRAWFilter(imageURL: url) else { throw RenderError.decodeFailed(url) }
+        linearFilter.boostAmount = 0
+        linearFilter.isGamutMappingEnabled = false
+        // The other one left entirely alone — this is the rendering the photographer would get from
+        // any ordinary conversion of this file, and matching it is the whole point.
+        guard let linearImage = linearFilter.outputImage,
+              let renderedImage = renderedFilter.outputImage else { throw RenderError.decodeFailed(url) }
+
+        let edge: CGFloat = 1000
+        let scale = edge / linearImage.extent.width
+        let smallLinear = linearImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let smallRendered = renderedImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let w = Int(smallLinear.extent.width), h = Int(smallLinear.extent.height)
+        guard w > 0, h > 0 else { throw RenderError.decodeFailed(url) }
+
+        var linearPixels = [Float](repeating: 0, count: w * h * 4)
+        var renderedPixels = [Float](repeating: 0, count: w * h * 4)
+        linearPixels.withUnsafeMutableBytes { raw in
+            context.render(smallLinear, toBitmap: raw.baseAddress!, rowBytes: w * 16,
+                           bounds: smallLinear.extent, format: .RGBAf, colorSpace: linearSpace)
+        }
+        // The rendered side is read in sRGB, which is what "as normally converted" means.
+        let displaySpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        renderedPixels.withUnsafeMutableBytes { raw in
+            context.render(smallRendered, toBitmap: raw.baseAddress!, rowBytes: w * 16,
+                           bounds: smallRendered.extent, format: .RGBAf, colorSpace: displaySpace)
+        }
+
+        // Drop alpha, keeping the two sides aligned pixel for pixel.
+        var linear = [Float](); linear.reserveCapacity(w * h * 3)
+        var rendered = [Float](); rendered.reserveCapacity(w * h * 3)
+        for pixel in 0..<(w * h) {
+            for channel in 0..<3 {
+                linear.append(linearPixels[pixel * 4 + channel])
+                rendered.append(renderedPixels[pixel * 4 + channel])
+            }
+        }
+        return HDRToneCurve(linear: linear, rendered: rendered, channels: 3)
     }
 
     /// Relative exposure from EXIF: how much light this frame collected, on an arbitrary but
