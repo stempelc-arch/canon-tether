@@ -1457,6 +1457,73 @@ Preferences → Backup Drives shows each one's connected state as the list is dr
 Covered by `Tests/CanonTetherTests/CaptureBackupTests.swift` and two `swiftc` harnesses (16 checks on
 the engine including the `/Volumes` trap, 6 on settings persistence).
 
+## HDR: dynamic range, not a tone-mapped look (2026-09-29)
+
+Toolbar → HDR shoots three RAW exposures and merges them. The brief was explicit: expand dynamic
+range, avoid the cliché.
+
+**The cliché comes from *local* tone mapping** — operators that decide a pixel from its
+neighbourhood, producing haloes and flat, crunchy midtones. `HDRMerge` has no local operator at all.
+Frames are combined in linear light, the result is anchored to the *metered* frame so its midtones
+land exactly where that frame put them, and the only tone manipulation is a **global** shoulder
+above `defaultKnee = 0.75`. Below the knee output equals input, bit for bit. Shadows are never
+lifted — that is the other half of the cliché, and the information is now in the file for anyone who
+wants to.
+
+- **The shoulder is C¹ at the knee.** A slope discontinuity there draws a visible band across a sky.
+- **Sample weighting is a raised cosine, not a triangle.** A triangle's corner at the midpoint makes
+  two overlapping exposures cross with a discontinuous derivative — banding, again in skies.
+- **Nothing is extrapolated.** Past what the bracket photographed, the merge carries the best
+  estimate any frame supports and stops. Inventing detail is how a merge produces convincing
+  nonsense.
+
+### RAW is the point, and ImageIO throws it away
+
+Measured on a real CR2 from this body: **ImageIO's decode returns 8 bits per component and clips at
+white**, discarding precisely what RAW is for. `CIRAWFilter` rendered into `extendedLinearSRGB` with
+`boostAmount = 0` and gamut mapping off returns float running **−0.05 … 1.97** — nearly a stop of
+headroom above white before any bracketing. `HDRRenderer` therefore uses Core Image, not the
+ImageIO path `FocusStackRenderer` uses, and `HDRMerge.Frame` takes **linear** light.
+
+Well-exposedness is still judged on the *encoded* position: linear puts a midtone near 0.18, so
+weighting there would dismiss most of a correctly-exposed frame as nearly black.
+
+### Capture
+
+Three frames — the range comes from the bracket's *width*, and more frames inside it buy overlap the
+weighting already handles, at the cost of RAW downloads and chances to move. Darkest first, so the
+frame holding the highlights lands before anything drifts.
+
+**Shutter only.** Aperture would change depth of field between frames and make the merge blend
+differently-focused images; ISO would change the noise floor, the very thing a bracket improves.
+`ExposureGrid` measures shutter as `-log2(seconds)`, so its scale *rises* as the frame darkens — the
+first version had that sign backwards and shot the bracket inside out, which merges perfectly
+cleanly and quietly holds less range. There is a test pinning the direction.
+
+Out-of-range is **refused**, not shot at whatever is nearest. The shutter is restored with retries
+and a read-back, like `restoreImageFormat` — leaving the body two or four stops off metered would
+ruin the next shot with nothing to say why. Frames are grouped in a `<stamp> HDR` folder and hidden
+from the gallery exactly as a focus stack's are; only the merged `-hdr.tif` appears.
+
+### No alignment, deliberately
+
+A bracket is a couple of seconds under app control on a tripod, and registering *differently exposed*
+frames is a harder problem than registering a focus stack — a bad estimate smears the highlights the
+bracket exists to recover. If a frame moves, reshoot.
+
+### Two debugging lessons from building it
+
+- **The first end-to-end test merged three CR2s that turned out to be different scenes.** The garbage
+  output looked exactly like a coordinate bug, and I "fixed" it by flipping the strips — which was
+  wrong, and only showed up as wrong once the test used three copies of one frame. Verify a pipeline
+  on inputs you have actually looked at.
+- Core Image's origin is bottom-left so `bandRect` is computed from the bottom, but
+  `render(toBitmap:)` fills top-down within those bounds. The conventions cancel; the obvious
+  correction is the bug.
+
+Covered by `HDRMergeTests`, `HDRPlanTests`, and two `swiftc` harnesses (78 + 15 checks). The renderer
+is verified on real CR2s; the *bracket* is unverified until it runs on the camera.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).

@@ -422,6 +422,74 @@ final class CameraViewModel: ObservableObject {
 
     private var liveViewToggleTask: Task<Void, Never>?
 
+    // MARK: - HDR
+
+    /// Spread for the next HDR bracket, remembered between shots. Plain `UserDefaults` rather than
+    /// `@AppStorage`, which is a SwiftUI property wrapper and not available on a view model.
+    static let hdrSpreadKey = "hdrSpread"
+    @Published var hdrSpread: HDRPlan.Spread = HDRPlan.Spread(
+        rawValue: UserDefaults.standard.object(forKey: CameraViewModel.hdrSpreadKey) as? Int ?? 2) ?? .twoStops {
+        didSet { UserDefaults.standard.set(hdrSpread.rawValue, forKey: Self.hdrSpreadKey) }
+    }
+
+    /// Shoots an exposure bracket and merges it, publishing only the merged result.
+    ///
+    /// The merge runs off the main actor at `.utility`: it is several seconds of CPU on full-
+    /// resolution RAW, and the same lesson as the focus-stack merge applies — saturating the
+    /// machine at a higher priority starves the live-view decode and freezes the UI, which is
+    /// indistinguishable from a hang.
+    func captureHDR() {
+        guard isConnected, !isBusy else { return }
+        let plan = HDRPlan(spread: hdrSpread)
+        isBusy = true
+        statusText = "HDR — \(plan.summary(metered: nil))"
+        Task {
+            defer { Task { @MainActor in self.isBusy = false } }
+            do {
+                let result = try await session.captureHDRBracket(plan: plan) { message in
+                    Task { @MainActor [weak self] in self?.statusText = message }
+                }
+                await MainActor.run { self.statusText = "Merging \(result.frames.count) exposures…" }
+
+                let output = result.folder.appendingPathComponent(
+                    CaptureLocation.mergedFileName(inStackFolder: result.folder))
+                let frames = result.frames
+                let reference = result.referenceIndex
+                let render = try await Task.detached(priority: .utility) {
+                    try HDRRenderer.render(urls: frames, referenceIndex: reference, outputURL: output)
+                }.value
+
+                await MainActor.run {
+                    self.registerMergedHDR(render.outputURL, recoveredStops: render.recoveredStops)
+                }
+            } catch is CancellationError {
+                await MainActor.run { self.statusText = "HDR cancelled" }
+            } catch {
+                await MainActor.run { self.statusText = error.localizedDescription }
+            }
+        }
+    }
+
+    /// Publishes the merged HDR, and says what the bracket actually bought.
+    ///
+    /// Reporting the recovered stops matters: a bracket of a scene that fitted in one frame recovers
+    /// nothing, and the photographer should learn that from the app rather than by comparing files.
+    private func registerMergedHDR(_ url: URL, recoveredStops: Double) {
+        let folder = url.deletingLastPathComponent()
+        guard folder.deletingLastPathComponent() == CaptureLocation.directory else { return }
+        if let existing = captures.firstIndex(of: url) {
+            captures.remove(at: existing)
+            captures.append(url)
+        } else {
+            captures.append(url)
+            captureCount += 1
+        }
+        lastCaptureURL = url
+        statusText = recoveredStops >= 0.25
+            ? String(format: "HDR merged — %.1f stops of highlight recovered", recoveredStops)
+            : "HDR merged — the scene already fitted in one exposure"
+    }
+
     func capture() {
         // Ignore shutter presses while the link is down — Space has no disabled state to
         // respect — so we don't leave the busy spinner hung waiting on a reconnect.

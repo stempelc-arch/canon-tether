@@ -125,6 +125,31 @@ public struct ContentView: View {
             .help("Shoot a focus bracket and merge it into one all-in-focus image")
             .disabled(!viewModel.isConnected)
 
+            // A menu rather than a plain button: the spread is the one thing that changes between
+            // scenes, and burying it in Preferences would mean leaving the shot to go and set it.
+            Menu {
+                ForEach(HDRPlan.Spread.allCases) { spread in
+                    Button {
+                        viewModel.hdrSpread = spread
+                        viewModel.captureHDR()
+                    } label: {
+                        Text("Shoot HDR \(spread.label)")
+                    }
+                }
+                Divider()
+                Picker("Default spread", selection: $viewModel.hdrSpread) {
+                    ForEach(HDRPlan.Spread.allCases) { spread in
+                        Text(spread.label).tag(spread)
+                    }
+                }
+            } label: {
+                Label("HDR", systemImage: "camera.filters")
+            } primaryAction: {
+                viewModel.captureHDR()
+            }
+            .help("Shoot an exposure bracket in RAW and merge it for more dynamic range (\(viewModel.hdrSpread.label))")
+            .disabled(!viewModel.isConnected || viewModel.isBusy)
+
             toolbarSeparator
         }
 

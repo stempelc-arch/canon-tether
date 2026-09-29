@@ -34,6 +34,16 @@ enum CaptureLocation {
     /// photographs — nobody wants twelve near-identical rack-focus frames filling the filmstrip —
     /// so they live in their own folder per capture and only the merged result is shown.
     static let stackFolderSuffix = " Focus Stack"
+    /// An HDR bracket's frames are grouped exactly like a focus stack's, and for the same reason:
+    /// three exposures of one subject are one photograph, not three, and listing them buries the
+    /// real shots. Only the suffix and the merged file's name differ.
+    static let hdrFolderSuffix = " HDR"
+
+    static let groupFolderSuffixes = [stackFolderSuffix, hdrFolderSuffix]
+
+    static func hdrFolderName(for date: Date) -> String {
+        DateFormatter.captureFilenameFormatter.string(from: date) + hdrFolderSuffix
+    }
 
     /// Name of the subfolder for a bracket shot at `date`, e.g. "20260911-143302 Focus Stack".
     /// Shares the capture filename stamp so a stack sorts next to the frames around it.
@@ -42,13 +52,16 @@ enum CaptureLocation {
     }
 
     static func isStackFolder(_ url: URL) -> Bool {
-        url.lastPathComponent.hasSuffix(stackFolderSuffix)
+        groupFolderSuffixes.contains { url.lastPathComponent.hasSuffix($0) }
     }
 
     /// Filename of the merged image inside a stack folder, derived from the folder's own stamp.
     static func mergedFileName(inStackFolder folder: URL) -> String {
-        let stamp = folder.lastPathComponent.replacingOccurrences(of: stackFolderSuffix, with: "")
-        return stamp + "-stack.tif"
+        let name = folder.lastPathComponent
+        if name.hasSuffix(hdrFolderSuffix) {
+            return name.replacingOccurrences(of: hdrFolderSuffix, with: "") + "-hdr.tif"
+        }
+        return name.replacingOccurrences(of: stackFolderSuffix, with: "") + "-stack.tif"
     }
 
     /// The merged TIFF inside a stack folder, if it has been rendered yet. This is the one file
@@ -2064,6 +2077,154 @@ actor GPhotoSession {
             if let exact = choices.first(where: { $0.lowercased() == size }) { return exact }
         }
         return nil
+    }
+
+    // MARK: - HDR bracket
+
+    struct HDRBracketResult {
+        let folder: URL
+        let frames: [URL]
+        /// Index of the metered frame, which the merge anchors to.
+        let referenceIndex: Int
+    }
+
+    /// Shoots an exposure bracket: the metered exposure plus one darker and one brighter frame.
+    ///
+    /// The tether watch is paused throughout, as for a focus bracket — it would only compete for the
+    /// command lock this needs, and the shutter is being driven here rather than watched for.
+    func captureHDRBracket(plan: HDRPlan,
+                           status: @escaping @Sendable (String) -> Void) async throws -> HDRBracketResult {
+        try await withTetherPaused {
+            try await withRAWCapture {
+                try await captureHDRBracketInner(plan: plan, status: status)
+            }
+        }
+    }
+
+    private func captureHDRBracketInner(plan: HDRPlan,
+                                        status: @escaping @Sendable (String) -> Void) async throws -> HDRBracketResult {
+        // What the camera is metered at right now, and what it will accept.
+        let output = try await getConfig(ExposureGrid.shutterPath)
+        guard let setting = CameraSetting.parse(from: output, path: ExposureGrid.shutterPath),
+              !setting.readOnly else {
+            throw GPhotoError.commandFailed("The camera won't let the shutter speed be set — take it off a fully automatic mode.")
+        }
+        let metered = setting.current
+        guard let speeds = plan.shutterSpeeds(metered: metered, choices: setting.choices) else {
+            throw GPhotoError.commandFailed(
+                "\(metered) is too close to the end of this body's shutter range for a \(plan.spread.label) bracket. "
+                + "Pick a middle shutter speed, or use a narrower spread.")
+        }
+        log("hdr: metered \(metered), shooting \(speeds.joined(separator: ", "))")
+
+        // The frames go into their own folder, hidden from the gallery, exactly as a focus stack's
+        // do: three exposures of one subject are one photograph.
+        let folder = captureDirectory.appendingPathComponent(CaptureLocation.hdrFolderName(for: Date()))
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        stackGroupDirectory = folder
+        defer { stackGroupDirectory = nil }
+
+        var captured: [URL] = []
+        let release = try await releaseValues()
+        do {
+            for (index, speed) in speeds.enumerated() {
+                try Task.checkCancellation()
+                status("HDR \(index + 1) of \(speeds.count) — \(speed)")
+                try await withCommandLock {
+                    try await setConfigLocked(ExposureGrid.shutterPath, speed)
+                    // Let the body settle on the new speed before releasing: a shutter change and a
+                    // release in the same breath has been seen to fire at the previous setting,
+                    // which silently produces two frames at one exposure and a bracket with a hole.
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    try await releaseShutterLocked(release)
+                }
+                captured.append(contentsOf: try await withCommandLock {
+                    await drainDownloadsLocked(expected: 1)
+                })
+            }
+        } catch {
+            await restoreShutter(metered)
+            throw error
+        }
+        await restoreShutter(metered)
+
+        guard captured.count == speeds.count else {
+            throw GPhotoError.commandFailed("Only \(captured.count) of \(speeds.count) exposures arrived.")
+        }
+        return HDRBracketResult(folder: folder, frames: captured, referenceIndex: plan.referenceIndex)
+    }
+
+    /// Puts the shutter back where the photographer left it.
+    ///
+    /// Retried and read back, for the reason `restoreImageFormat` is: the body answers PTP Device
+    /// Busy while it is still writing the last frame, and a single best-effort attempt leaves the
+    /// camera on the bracket's last speed — which on this body is two or four stops from what was
+    /// metered, and the next shot is ruined with nothing to say why.
+    private func restoreShutter(_ speed: String) async {
+        for attempt in 1...5 {
+            try? await setConfig(ExposureGrid.shutterPath, speed)
+            if let output = try? await getConfig(ExposureGrid.shutterPath),
+               let setting = CameraSetting.parse(from: output, path: ExposureGrid.shutterPath),
+               setting.current == speed {
+                log("hdr: shutter restored to \(speed)")
+                return
+            }
+            try? await Task.sleep(nanoseconds: UInt64(attempt) * 400_000_000)
+        }
+        log("hdr: WARNING could not restore the shutter to \(speed)")
+        self.status("Couldn't put the shutter back to \(speed) — check the camera")
+    }
+
+    /// The plain RAW entry, for an HDR bracket.
+    ///
+    /// Same defensiveness as `jpegChoice` and for the same reason — libgphoto2 only partly decodes
+    /// this body's list, which contains bare hex codes it has no name for. Take the unadorned "RAW",
+    /// never a `RAW + 0x50` combination (that shoots RAW *and* a JPEG, doubling the download for a
+    /// file the merge ignores) and never a hex code.
+    static func rawChoice(in choices: [String]) -> String? {
+        if let plain = choices.first(where: { $0.lowercased() == "raw" }) { return plain }
+        // A named variant on builds that decode them, but still not a RAW+JPEG pair.
+        return choices.first {
+            let lower = $0.lowercased()
+            return lower.contains("raw") && !lower.contains("+") && !lower.hasPrefix("m") && !lower.hasPrefix("s")
+        }
+    }
+
+    /// Runs `body` with the camera shooting RAW, restoring the previous format afterwards.
+    ///
+    /// The mirror image of `withJPEGCapture`, and the reasoning inverts too: a focus stack is a
+    /// dozen-plus frames whose merge is clamped to sRGB anyway, so RAW costs time and buys nothing —
+    /// but an HDR bracket is three frames whose whole purpose is dynamic range, and RAW is where
+    /// that range lives. Measured on a CR2 from this body, `CIRAWFilter` in a linear space returns
+    /// values up to 1.97 where ImageIO's decode clips at 1.0 and gives only 8 bits per component.
+    func withRAWCapture<T>(_ body: () async throws -> T) async throws -> T {
+        if imageFormatDepth == 0 {
+            if let setting = try? await imageFormatSetting(),
+               !setting.readOnly,
+               let raw = Self.rawChoice(in: setting.choices),
+               setting.current != raw {
+                imageFormatToRestore = setting.current
+                // Persisted before the switch, for the reason spelled out in `withJPEGCapture`:
+                // a restore that fails silently leaves the photographer's body on the wrong format.
+                UserDefaults.standard.set(setting.current, forKey: Self.pendingFormatRestoreKey)
+                try? await setConfig(Self.imageFormatPath, raw)
+                log("image format: switched to \(raw) for the HDR bracket (was \(setting.current))")
+            } else {
+                imageFormatToRestore = nil
+            }
+        }
+        imageFormatDepth += 1
+        defer {
+            imageFormatDepth -= 1
+            if imageFormatDepth == 0, let restore = imageFormatToRestore {
+                imageFormatToRestore = nil
+                Task { [weak self] in
+                    guard let self else { return }
+                    await self.restoreImageFormat(restore)
+                }
+            }
+        }
+        return try await body()
     }
 
     private func imageFormatSetting() async throws -> CameraSetting? {
