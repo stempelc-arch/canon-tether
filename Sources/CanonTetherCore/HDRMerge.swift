@@ -58,6 +58,15 @@ public enum HDRMerge {
     /// Fraction of the encoded range at each end treated as unusable.
     public static let deadZone: Float = 0.02
 
+    /// How far two frames may disagree about a pixel's scene radiance, in stops, before one of them
+    /// is taken to be showing something that moved.
+    ///
+    /// Loose enough to tolerate noise — an underexposed frame's shadows wander by a good fraction of
+    /// a stop — and tight enough to catch a leaf that has blown across a bright sky, which differs
+    /// by several stops. Tightening this does not make a merge sharper; it makes it throw away
+    /// honest samples and get noisier.
+    public static let ghostTolerance: Float = 1.0
+
     // MARK: - Merging
 
     /// One frame of the bracket, in **linear light**.
@@ -114,6 +123,10 @@ public enum HDRMerge {
         // scale 2, and its linear values are divided by that to describe the same scene radiance.
         let scales = frames.map { Float($0.exposure) / referenceExposure }
 
+        // Scratch for the consistency pass, allocated once.
+        var radiances = [Float](repeating: 0, count: frames.count)
+        var weights = [Float](repeating: 0, count: frames.count)
+
         for i in 0..<(width * height * channels) {
             var weighted: Float = 0
             var total: Float = 0
@@ -131,9 +144,51 @@ public enum HDRMerge {
                     weighted += radiance * weight
                     total += weight
                 }
+                radiances[index] = radiance
+                weights[index] = weight
                 brightestUsable = max(brightestUsable, radiance)
                 darkestUsable = min(darkestUsable, radiance)
             }
+
+            // **Reject frames that disagree about what was there.**
+            //
+            // Once each frame's value is divided by its own exposure, every frame should report the
+            // same scene radiance for the same point. Where they do not, something moved between
+            // exposures — leaves in wind, a branch, a person — and averaging them blends a leaf from
+            // one frame with the sky from another. That is the soft doubled edge that shows up
+            // around foliage, and no amount of tone curve fixes it.
+            //
+            // The frame carrying the most weight is taken as the truth for that pixel (it is the
+            // best-exposed view of it), and any frame differing by more than `ghostTolerance` stops
+            // is dropped. Tolerance rather than exact agreement because noise, especially in the
+            // shadows of an underexposed frame, moves the value around legitimately.
+            if total > 0 {
+                var anchorIndex = 0
+                var anchorWeight: Float = -1
+                for index in 0..<frames.count where weights[index] > anchorWeight {
+                    anchorWeight = weights[index]
+                    anchorIndex = index
+                }
+                let anchor = radiances[anchorIndex]
+                if anchor > 0 {
+                    var keptWeighted: Float = 0
+                    var keptTotal: Float = 0
+                    for index in 0..<frames.count where weights[index] > 0 {
+                        let value = radiances[index]
+                        let disagreement = value > 0 ? abs(log2(value / anchor)) : .infinity
+                        if disagreement <= ghostTolerance {
+                            keptWeighted += value * weights[index]
+                            keptTotal += weights[index]
+                        }
+                    }
+                    // The anchor always survives its own test, so this cannot empty the set.
+                    if keptTotal > 0 {
+                        weighted = keptWeighted
+                        total = keptTotal
+                    }
+                }
+            }
+
             if total > 0 {
                 out.data[i] = weighted / total
             } else {

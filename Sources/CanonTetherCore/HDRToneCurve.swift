@@ -21,6 +21,19 @@ public struct HDRToneCurve: Sendable {
     /// Fraction of the camera's rendered maximum below which its curve is reproduced exactly.
     /// Covers the midtones and shadows — the bulk of any photograph.
     public static let holdBelow: Float = 0.6
+    /// How far up the range the shadow lift reaches. Above this, nothing is touched.
+    public static let shadowRange: Float = 0.5
+    /// Gamma applied at the very bottom. Below 1 brightens; 0.75 is a modest lift — about +60% at
+    /// 10% grey, +20% at 25%, and under +5% by the time it fades out.
+    public static let shadowGamma: Float = 0.75
+
+    /// Opens the shadows without lifting black off the floor.
+    public static func lift(_ value: Float) -> Float {
+        guard value > 0, value < shadowRange else { return value }
+        let fade = 1 - value / shadowRange          // full strength at black, nothing at the range
+        return value + (powf(value, shadowGamma) - value) * fade
+    }
+
     /// Shape of the extension above the handover. Below 1 is convex, keeping some contrast in the
     /// recovered range rather than letting it flatten into a wash near white.
     public static let highlightGamma: Float = 0.85
@@ -115,6 +128,26 @@ public struct HDRToneCurve: Sendable {
                     curve[bin] = start + (1 - start) * powf(t, Self.highlightGamma)
                 }
             }
+            // A modest, global lift of the shadows.
+            //
+            // Symmetric with what happens at the top. Recovered highlights were given display range
+            // by folding the camera's clipped white down; the bottom end needs the same courtesy, or
+            // the extra exposures spent on the shadows buy noise reduction the photographer cannot
+            // see. The merge makes shadows *cleaner*; without this it does not make them *visible*.
+            //
+            // Global, and therefore not the cliché. The tone-mapped look comes from *local*
+            // operators deciding a pixel from its neighbourhood, which is what produces haloes; one
+            // curve applied to every pixel alike cannot halo — it is what any raw converter's
+            // Shadows slider does.
+            //
+            // **Black stays black.** The lift is a gamma applied under `shadowRange` and faded out
+            // by how far above black a value already is, so it approaches zero at zero. Adding a
+            // constant instead would raise the black point and give the milky, washed-out look that
+            // is the other half of what people mean by "HDR-looking".
+            for bin in 0..<Self.resolution {
+                curve[bin] = Self.lift(curve[bin])
+            }
+
             table.append(curve)
             whitePoint.append(curve[Self.resolution - 1])
         }

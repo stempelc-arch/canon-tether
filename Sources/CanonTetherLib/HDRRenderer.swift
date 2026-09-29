@@ -91,11 +91,18 @@ enum HDRRenderer {
         // white; guessing it from the darkest frame's exposure instead would anchor to the range
         // the bracket *could* have reached rather than the range the scene actually used, and throw
         // away contrast on every ordinary subject.
-        toneCurve.sceneWhite = try sceneWhite(images: images, exposures: exposures,
-                                              reference: min(max(referenceIndex, 0), urls.count - 1),
-                                              context: context, linearSpace: linearSpace)
-        FileHandle.appendLog(String(format: "hdr: scene white %.2f (%.2f stops above the metered frame)",
-                                    toneCurve.sceneWhite, log2(Double(max(toneCurve.sceneWhite, 1)))))
+        let measured = try sceneWhite(images: images, exposures: exposures,
+                                      reference: min(max(referenceIndex, 0), urls.count - 1),
+                                      context: context, linearSpace: linearSpace)
+        // Expose the merged scene, rather than inheriting the metered frame's exposure.
+        var keyGain = targetKey / measured.key
+        let limit = powf(2, keyAdjustmentLimit)
+        keyGain = Swift.min(Swift.max(keyGain, 1 / limit), limit)
+        toneCurve.sceneWhite = measured.white * keyGain
+        FileHandle.appendLog(String(format:
+            "hdr: scene key %.4f -> exposing %+.2f stops; white %.2f (%.2f stops over)",
+            measured.key, log2(Double(keyGain)), toneCurve.sceneWhite,
+            log2(Double(max(toneCurve.sceneWhite, 1)))))
 
         let extent = images[0].extent
         let width = Int(extent.width), height = Int(extent.height)
@@ -138,8 +145,13 @@ enum HDRRenderer {
                 frames.append(HDRMerge.Frame(image: strip, exposure: exposures[index]))
             }
 
-            let radiance = try HDRMerge.radiance(from: frames, reference: reference)
+            var radiance = try HDRMerge.radiance(from: frames, reference: reference)
             peakRadiance.append(contentsOf: radiance.data.filter { $0 > 1 })
+            // Apply the scene exposure before the curve, in linear light — it is an exposure
+            // change, and exposure belongs in linear.
+            if keyGain != 1 {
+                for i in 0..<radiance.data.count { radiance.data[i] *= keyGain }
+            }
             let shown = toneCurve.render(radiance)
             for i in 0..<(width * rows * channels) {
                 output[row * width * channels + i] = UInt16(min(max(shown.data[i], 0), 1) * 65535)
@@ -168,7 +180,7 @@ enum HDRRenderer {
                                    exposures: [Double],
                                    reference: Int,
                                    context: CIContext,
-                                   linearSpace: CGColorSpace) throws -> Float {
+                                   linearSpace: CGColorSpace) throws -> (white: Float, key: Float) {
         let edge: CGFloat = 600
         let scale = edge / images[0].extent.width
         var frames: [HDRMerge.Frame] = []
@@ -191,13 +203,31 @@ enum HDRRenderer {
         }
         let radiance = try HDRMerge.radiance(from: frames, reference: reference)
         var values = radiance.data.filter { $0.isFinite && $0 > 0 }
-        guard !values.isEmpty else { return 1 }
+        guard !values.isEmpty else { return (white: 1, key: 1) }
         values.sort()
         let percentile = values[Int(Double(values.count) * 0.999)]
+        let median = values[values.count / 2]
         // Never below 1: a scene that fitted in one exposure must render exactly as that exposure
         // did, with no compression at all.
-        return Swift.max(percentile, 1)
+        return (white: Swift.max(percentile, 1), key: Swift.max(median, 1e-6))
     }
+
+    /// Linear level the merged scene's middle is placed at.
+    ///
+    /// Middle grey. **The merge is exposed for the result, not for the metered frame.** Anchoring
+    /// the output to the metered exposure was the original design and it is why an HDR of a dark
+    /// room with a bright window came back looking exactly like the dark room: the extra exposures
+    /// recovered the window, and the shadows they also recorded were rendered at the brightness the
+    /// *metered* frame gave them, which is to say black. The whole point of shooting a bracket is
+    /// that no single frame's exposure is right for the scene.
+    static let targetKey: Float = 0.18
+
+    /// Most the result may be brightened or darkened relative to the metered frame, in stops.
+    ///
+    /// Bounded because the key is a median and a median can be misled — a frame that is mostly dark
+    /// wall has a low median and does not want three stops of lift. Beyond this the photographer's
+    /// own metering is the better guide.
+    static let keyAdjustmentLimit: Float = 3
 
     /// Samples the reference frame rendered two ways and builds the transfer between them.
     ///

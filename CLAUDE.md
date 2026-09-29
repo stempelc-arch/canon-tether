@@ -1759,6 +1759,34 @@ long.
 **Watch for this shape generally:** a timeout calibrated on short operations, applied to a feature
 whose whole purpose is the long ones.
 
+### Expose the merged scene, not the metered frame (2026-09-29)
+
+An HDR of a dark room with a bright window kept coming back looking like the dark room: "flatter, but
+hardly more detail". The bracket was blameless — auto-bracketing walked to −2…+4 and the +4 frame
+measured `crushed 0.0%`, so every shadow was recorded. The information was in the file and rendered
+at the brightness the **metered** frame gave it, which is to say black.
+
+That was the original design — anchor the result to the metered exposure so the picture keeps the
+rendering it was shot with — and it is wrong for a bracket. The whole reason to shoot one is that
+*no single frame's exposure is right for the scene*. `HDRRenderer` now measures the merged scene's
+median and exposes it to middle grey (`targetKey = 0.18`), bounded to ±3 stops because a median can
+be misled by a frame that is mostly dark wall. Applied in linear light, before the curve, because it
+is an exposure change.
+
+On a real bracket: scene key 0.0032, exposed +3 stops, and the interior goes from unreadable to fully
+open with the window unchanged.
+
+**The diagnostic failure is the more useful lesson.** For several rounds an offline harness was used
+to show "before and after" renders, and the harness picked its reference frame with
+`HDRRenderer.referenceIndex(for:)` — a median of the exposures, which on an even-sized bracket lands
+on the *brighter* middle frame — while the app passes the metered frame explicitly. Every comparison
+was therefore two stops apart before any of the changes being demonstrated. A shadow lift was
+credited with an improvement that was mostly an exposure difference, and the real defect stayed
+hidden behind it.
+
+**A harness must reproduce the caller's parameters, not just its code.** The harness now takes the
+reference index from the environment so it can be forced to match the app exactly.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).
