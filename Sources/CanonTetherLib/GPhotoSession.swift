@@ -521,8 +521,17 @@ actor GPhotoSession {
     /// exists and never say where. Don't rebuild this expecting a faster discovery path.
     private func networkCameraIP() -> String? {
         guard let arpOutput = try? runOneShot("/usr/sbin/arp", ["-an"]) else { return nil }
+        // Only interfaces where *this Mac* has a link-local address of its own. The camera is a
+        // neighbour on the cable, so it can only be on one of those.
+        //
+        // Without this filter the fallback took the first `169.254.x` address in the whole ARP
+        // table, and on a Mac with Wi-Fi up that is somebody else's AirDrop peer: observed the app
+        // trying to reach 169.254.57.52 on **en1 (Wi-Fi)** for four minutes while the camera sat
+        // answering pings in 0.3 ms at 169.254.76.171 on **en0 (Ethernet)**. Every log line looked
+        // healthy — "found camera at …, connecting…" — because discovery was certain and wrong.
+        let localInterfaces = linkLocalInterfaces()
         let pattern = Self.arpEntryPattern
-        var linkLocalFallback: String?
+        var candidates: [String] = []
         for line in arpOutput.split(separator: "\n") {
             let lineString = String(line)
             let nsLine = lineString as NSString
@@ -531,14 +540,48 @@ actor GPhotoSession {
             }
             let ip = nsLine.substring(with: match.range(at: 1))
             let mac = nsLine.substring(with: match.range(at: 2)).lowercased()
+            let interface = Self.arpInterface(in: lineString)
+            if let interface, !localInterfaces.isEmpty, !localInterfaces.contains(interface) { continue }
             if Self.canonOUIs.contains(where: { mac.hasPrefix($0) }) {
-                return ip // unambiguously the Canon body
+                return ip // unambiguously the Canon body, whatever else is on the network
             }
-            if ip.hasPrefix("169.254."), linkLocalFallback == nil {
-                linkLocalFallback = ip
+            if ip.hasPrefix("169.254.") { candidates.append(ip) }
+        }
+        // Prefer one that actually answers. ICMP is safe during pairing — it is a TCP connect to
+        // 15740 that aborts the camera's negotiation — and an address that does not answer is not
+        // worth a 100-second connect timeout.
+        for ip in candidates where isAnswering(ip) { return ip }
+        return candidates.first
+    }
+
+    /// Interfaces on which this Mac holds a 169.254 address.
+    private func linkLocalInterfaces() -> Set<String> {
+        guard let output = try? runOneShot("/sbin/ifconfig", []) else { return [] }
+        var found: Set<String> = []
+        var current: String?
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let text = String(line)
+            if !text.hasPrefix("\t"), !text.hasPrefix(" "), let name = text.split(separator: ":").first {
+                current = String(name)
+            } else if text.contains("inet 169.254."), let current {
+                found.insert(current)
             }
         }
-        return linkLocalFallback
+        return found
+    }
+
+    /// Whether an address replies to a single ping. Deliberately ICMP, never a TCP probe.
+    private func isAnswering(_ ip: String) -> Bool {
+        guard let output = try? runOneShot("/sbin/ping", ["-c", "1", "-W", "400", "-t", "1", ip], timeout: 2)
+        else { return false }
+        return output.contains("bytes from")
+    }
+
+    /// The interface an `arp -an` line names: `? (169.254.76.171) at 0:1:2:3:4:5 on en0 [ethernet]`.
+    static func arpInterface(in line: String) -> String? {
+        let parts = line.split(separator: " ")
+        guard let index = parts.firstIndex(of: "on"), index + 1 < parts.count else { return nil }
+        return String(parts[index + 1])
     }
 
     private func runOneShot(_ executablePath: String, _ arguments: [String], timeout: TimeInterval = 5) throws -> String {

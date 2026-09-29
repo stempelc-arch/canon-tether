@@ -1710,6 +1710,33 @@ values lightens shadows and highlights by different amounts and leaves a differe
 
 Covered by `ExposureRampTests` and two `swiftc` harnesses (12 + 17 checks). Unverified on the camera.
 
+### Discovery must be scoped to the camera's own interface (2026-09-29)
+
+Reported as "the camera and app aren't pairing" and then as "extremely slow" — it was both, and one
+bug. Eight minutes and five 100-second connect timeouts before it got through.
+
+`networkCameraIP`'s fallback took the **first** `169.254.x` address in the whole `arp -an` table.
+On a Mac with Wi-Fi up, that is somebody else's AirDrop peer:
+
+    ? (169.254.57.52)  at 32:3e:… on en1 [ethernet]   <- Wi-Fi peer, what the app chose
+    ? (169.254.76.171) at …      on en0               <- the camera, answering ping in 0.3 ms
+
+Every log line looked healthy — `found camera at 169.254.57.52, connecting...` — because discovery
+was confident and wrong. The camera was on Ethernet the whole time, link active at gigabit.
+
+Two defences, either of which would have prevented it:
+
+- **Only interfaces where this Mac holds a link-local address of its own** are considered. The
+  camera is a neighbour on the cable; it cannot be on an interface this Mac has no link-local
+  presence on.
+- **Candidates must answer ICMP** before being handed to the connect path. An address that does not
+  reply is not worth a 100-second timeout. ICMP remains safe during pairing — the footgun is a TCP
+  connect to 15740, not a ping.
+
+**A confident wrong answer is worse than no answer.** Discovery reported success at every step, so
+the failure looked like the camera's fault — the very thing the "silent camera isn't broken" note
+warns about, in the opposite direction.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).
