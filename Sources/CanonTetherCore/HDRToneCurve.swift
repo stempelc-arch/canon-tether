@@ -21,6 +21,19 @@ public struct HDRToneCurve: Sendable {
     /// Fraction of the camera's rendered maximum below which its curve is reproduced exactly.
     /// Covers the midtones and shadows — the bulk of any photograph.
     public static let holdBelow: Float = 0.6
+    /// How much of the S-curve to blend in, 0…1.
+    ///
+    /// 0.45 lands near the "+60 contrast" the photographer was reaching for by hand on a merge that
+    /// already had the right range.
+    public static let contrastStrength: Float = 0.45
+
+    /// A smoothstep S about mid-grey, blended by `contrastStrength`.
+    public static func contrast(_ value: Float) -> Float {
+        let v = Swift.min(Swift.max(value, 0), 1)
+        let s = v * v * (3 - 2 * v)              // 0 at 0, 1 at 1, steeper through the middle
+        return v + (s - v) * contrastStrength
+    }
+
     /// How far up the range the shadow lift reaches. Above this, nothing is touched.
     public static let shadowRange: Float = 0.5
     /// Gamma applied at the very bottom. Below 1 brightens; 0.75 is a modest lift — about +60% at
@@ -128,6 +141,24 @@ public struct HDRToneCurve: Sendable {
                     curve[bin] = start + (1 - start) * powf(t, Self.highlightGamma)
                 }
             }
+            // **Contrast.** Put back what the range compression takes out.
+            //
+            // Fitting eight or ten stops into a display is a flattening operation by definition:
+            // Reinhard squashes the upper midtones and the shadow lift raises the bottom, and
+            // neither restores the slope through the middle. The photographer's own verdict on the
+            // first version that got the range right was that it needed "+60 contrast in
+            // Lightroom" — which is the app asking someone else to finish its job.
+            //
+            // A smoothstep S blended by `contrastStrength`: monotonic, smooth everywhere, and it
+            // pins 0 and 1 so neither black nor white moves. Global, like everything else here, so
+            // it cannot halo.
+            //
+            // Applied *before* the shadow lift, so the lift has the last word and the shadows stay
+            // open — an S-curve applied afterwards re-darkens the bottom end and undoes it.
+            for bin in 0..<Self.resolution {
+                curve[bin] = Self.contrast(curve[bin])
+            }
+
             // A modest, global lift of the shadows.
             //
             // Symmetric with what happens at the top. Recovered highlights were given display range

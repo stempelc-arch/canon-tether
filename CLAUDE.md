@@ -1810,6 +1810,34 @@ hidden behind it.
 **A harness must reproduce the caller's parameters, not just its code.** The harness now takes the
 reference index from the environment so it can be forced to match the app exactly.
 
+### Range compression flattens; put the contrast back (2026-09-29)
+
+The photographer's verdict on the first merge that got the range right: *"took that output into
+Lightroom, bumped the contrast +60 and was pretty happy"*. That is the most useful kind of feedback —
+it says the range is correct and the rendering is flat, which are two different problems.
+
+Flatness is inherent to what the merge does. Fitting eight or ten stops into a display squashes the
+upper midtones (Reinhard) and raises the bottom (the shadow lift), and neither puts the slope back
+through the middle. `HDRToneCurve.contrast` blends in a smoothstep S at `contrastStrength = 0.45`,
+which lands near the +60 that was being dialled in by hand.
+
+It is applied **before** the shadow lift, so the lift has the last word: an S-curve applied
+afterwards re-darkens the bottom end and undoes exactly what the extra exposures were shot for.
+Smoothstep pins 0 and 1, so neither black nor white moves, and mid-grey stays put so the picture
+does not change overall brightness. Global, like every other stage here, so it cannot halo.
+
+### Some scenes cannot have both, and that is physics
+
+The same bracket showed the limit. Its room midtone sat about **9 stops** below the window, and a
+display holds roughly **2.5 stops** above middle grey. Rendering the room at middle grey therefore
+*must* put the window near white; no global curve can do otherwise. The levers are where the room
+sits (`targetKey`, and `keyAdjustmentLimit` which is usually what actually binds — this scene wanted
+6.6 stops of lift and got the capped 3) and nothing else, short of local tone mapping, which is the
+look this feature exists to avoid.
+
+Worth saying out loud when a result disappoints: check whether the scene is asking for more range
+than the output medium has, before changing any code.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).
