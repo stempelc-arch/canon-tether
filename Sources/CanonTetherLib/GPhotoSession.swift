@@ -534,6 +534,8 @@ actor GPhotoSession {
         // trying to reach 169.254.57.52 on **en1 (Wi-Fi)** for four minutes while the camera sat
         // answering pings in 0.3 ms at 169.254.76.171 on **en0 (Ethernet)**. Every log line looked
         // healthy — "found camera at …, connecting…" — because discovery was certain and wrong.
+        // Interfaces on which this Mac has a link-local address. When the camera's link is down
+        // this is empty — which is itself the answer, and must not be treated as "no filter".
         let localInterfaces = linkLocalInterfaces()
         let pattern = Self.arpEntryPattern
         var candidates: [String] = []
@@ -552,11 +554,26 @@ actor GPhotoSession {
             }
             if ip.hasPrefix("169.254.") { candidates.append(ip) }
         }
-        // Prefer one that actually answers. ICMP is safe during pairing — it is a TCP connect to
-        // 15740 that aborts the camera's negotiation — and an address that does not answer is not
-        // worth a 100-second connect timeout.
+        // The address this camera was last reached at, if it is answering now. A remembered
+        // address beats any heuristic: it is the one host known to have been the camera.
+        if let remembered = UserDefaults.standard.string(forKey: Self.lastKnownIPKey),
+           candidates.contains(remembered) || localInterfaces.isEmpty,
+           isAnswering(remembered) {
+            return remembered
+        }
+
+        // **No blanket fallback.** Returning "the first link-local address we can see" is what kept
+        // sending the app to a Wi-Fi peer: on a Mac with Wi-Fi up, link-local addresses belong to
+        // AirDrop and friends, and one of them answered ICMP perfectly happily while the camera was
+        // not yet on the network. Three separate bogus addresses were tried across one afternoon,
+        // each costing a 100-second connect timeout.
+        //
+        // If this Mac has no link-local address of its own, the wired link to the camera is not up,
+        // and there is nothing on that network to find — say so and wait, rather than spending
+        // minutes proving that somebody's laptop is not a camera.
+        guard !localInterfaces.isEmpty else { return nil }
         for ip in candidates where isAnswering(ip) { return ip }
-        return candidates.first
+        return nil
     }
 
     /// Interfaces on which this Mac holds a 169.254 address.

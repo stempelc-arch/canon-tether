@@ -1710,6 +1710,29 @@ values lightens shadows and highlights by different amounts and leaves a differe
 
 Covered by `ExposureRampTests` and two `swiftc` harnesses (12 + 17 checks). Unverified on the camera.
 
+### …and must refuse to guess when the link is down (2026-09-29)
+
+The interface filter above was not enough, and the way it failed is worth keeping. Measured across
+one afternoon, discovery tried **three different bogus addresses** — 169.254.57.52, .63.248 and
+.199.60 — each costing a 100-second connect timeout, then reached the camera in 3–5 seconds once it
+finally looked at the right one. Times from first discovery to `Connected`: 476 s, 283 s, 158 s,
+150 s, 86 s — against 3.9 s when it started with the right address.
+
+Both defences failed for one reason. When the camera's link is down, **this Mac has no link-local
+address at all**, so `linkLocalInterfaces()` returns empty — and the filter was written as
+`!localInterfaces.isEmpty && !contains(interface)`, which *skips the check* in exactly that case.
+The code then fell back to `candidates.first`, and on a Mac with Wi-Fi up the first link-local
+address belongs to AirDrop or similar. The ICMP check did not save it either: those peers are real
+hosts and answer pings perfectly happily.
+
+So: an empty set of local link-local interfaces is now **the answer, not the absence of one** —
+the wired link is not up, there is nothing on that network to find, and discovery returns `nil` and
+waits. The remembered address is tried first when it answers, since it is the one host known to have
+been the camera. There is no blanket fallback any more.
+
+**A filter that disables itself when it has no data is not a filter.** It reads as a safety check and
+behaves as an unconditional pass, precisely in the conditions that make it necessary.
+
 ### Discovery must be scoped to the camera's own interface (2026-09-29)
 
 Reported as "the camera and app aren't pairing" and then as "extremely slow" — it was both, and one
