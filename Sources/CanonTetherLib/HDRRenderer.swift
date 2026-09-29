@@ -248,6 +248,68 @@ enum HDRRenderer {
         return HDRToneCurve(linear: linear, rendered: rendered, channels: 3)
     }
 
+    /// Mean brightness of a frame, in linear light, for the timelapse ramp.
+    ///
+    /// A high percentile rather than the mean: the mean of a landscape is dominated by whichever of
+    /// sky and ground is larger, so a camera panned slightly between sequences would meter
+    /// differently for no reason the viewer can see. The 70th percentile tracks "how bright is the
+    /// lit part of this scene", which is what a ramp should hold steady, and ignores both a dark
+    /// foreground and a small bright sun.
+    static func rampBrightness(of url: URL) -> Double? {
+        guard let filter = CIRAWFilter(imageURL: url) else { return nil }
+        filter.boostAmount = 0
+        filter.isGamutMappingEnabled = false
+        guard let image = filter.outputImage else { return nil }
+        let linearSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
+        let context = CIContext(options: [.workingColorSpace: linearSpace,
+                                          .outputColorSpace: linearSpace,
+                                          .cacheIntermediates: false])
+        let edge: CGFloat = 400
+        let scale = edge / image.extent.width
+        let small = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let w = Int(small.extent.width), h = Int(small.extent.height)
+        guard w > 0, h > 0 else { return nil }
+        var buffer = [Float](repeating: 0, count: w * h * 4)
+        buffer.withUnsafeMutableBytes { raw in
+            context.render(small, toBitmap: raw.baseAddress!, rowBytes: w * 16,
+                           bounds: small.extent, format: .RGBAf, colorSpace: linearSpace)
+        }
+        var luma = [Float](); luma.reserveCapacity(w * h)
+        for pixel in 0..<(w * h) {
+            let value = 0.2126 * buffer[pixel * 4] + 0.7152 * buffer[pixel * 4 + 1]
+                      + 0.0722 * buffer[pixel * 4 + 2]
+            if value.isFinite, value > 0 { luma.append(value) }
+        }
+        guard !luma.isEmpty else { return nil }
+        luma.sort()
+        return Double(luma[Int(Double(luma.count) * 0.70)])
+    }
+
+    /// Develops one timelapse frame with a gain, straight to a 16-bit TIFF.
+    ///
+    /// The gain is what makes a 1/3-stop exposure click invisible, so it is applied in **linear**
+    /// light, before the rendering — a gain applied to already-rendered values would lighten the
+    /// shadows and the highlights by different amounts and leave a different seam behind.
+    static func developRamped(_ url: URL, gainStops: Double, to outputURL: URL) throws {
+        guard let filter = CIRAWFilter(imageURL: url) else { throw RenderError.decodeFailed(url) }
+        // Apple's rendering, plus the correction as an exposure adjustment — `exposure` is in stops
+        // and acts on scene light, which is exactly what the deflicker gain is.
+        filter.exposure = Float(gainStops)
+        guard let image = filter.outputImage else { throw RenderError.decodeFailed(url) }
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        let context = CIContext(options: [.outputColorSpace: space])
+        guard let cg = context.createCGImage(image, from: image.extent,
+                                             format: .RGBA16, colorSpace: space) else {
+            throw RenderError.writeFailed
+        }
+        guard let destination = CGImageDestinationCreateWithURL(
+                outputURL as CFURL, UTType.tiff.identifier as CFString, 1, nil) else {
+            throw RenderError.writeFailed
+        }
+        CGImageDestinationAddImage(destination, cg, nil)
+        guard CGImageDestinationFinalize(destination) else { throw RenderError.writeFailed }
+    }
+
     /// What one exposure recorded: how much it lost at each end.
     ///
     /// Read at low resolution — this decides whether to shoot another frame, and the answer is a

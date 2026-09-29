@@ -438,6 +438,71 @@ final class CameraViewModel: ObservableObject {
     /// resolution RAW, and the same lesson as the focus-stack merge applies — saturating the
     /// machine at a higher priority starves the live-view decode and freezes the UI, which is
     /// indistinguishable from a hang.
+    // MARK: - Timelapse
+
+    @Published var timelapseInterval: Double = 10
+    @Published var timelapseFrames: Int = 300
+    @Published var timelapseHighestISO: Double = 6400
+    @Published private(set) var timelapseProgress: String?
+
+    /// Shoots a timelapse, then develops every frame with the correction that removes the exposure
+    /// steps.
+    func captureTimelapse() {
+        guard isConnected, !isBusy else { return }
+        let interval = timelapseInterval
+        let count = timelapseFrames
+        let ceiling = timelapseHighestISO
+        isBusy = true
+        statusText = "Timelapse — \(count) frames every \(Int(interval))s"
+        Task {
+            defer { Task { @MainActor in self.isBusy = false; self.timelapseProgress = nil } }
+            do {
+                let result = try await session.captureTimelapse(
+                    intervalSeconds: interval, frameCount: count, highestISO: ceiling) { message in
+                        Task { @MainActor [weak self] in
+                            self?.statusText = message
+                            self?.timelapseProgress = message
+                        }
+                    }
+                guard result.frames.count > 1 else {
+                    await MainActor.run { self.statusText = "Timelapse ended with too few frames to develop" }
+                    return
+                }
+                await MainActor.run { self.statusText = "Developing \(result.frames.count) frames…" }
+
+                // Deflicker across the whole sequence, then write the corrected TIFFs.
+                let gains = ExposureRamp.deflicker(exposures: result.frames.map(\.exposure),
+                                                   brightness: result.frames.map(\.brightness))
+                let developed = result.folder.appendingPathComponent("Developed")
+                try? FileManager.default.createDirectory(at: developed, withIntermediateDirectories: true)
+                let frames = result.frames
+                let biggest = gains.map(abs).max() ?? 0
+                try await Task.detached(priority: .utility) {
+                    for (index, frame) in frames.enumerated() {
+                        let name = frame.url.deletingPathExtension().lastPathComponent + ".tif"
+                        try HDRRenderer.developRamped(frame.url, gainStops: gains[index],
+                                                      to: developed.appendingPathComponent(name))
+                        if index % 10 == 0 {
+                            await MainActor.run { [weak self] in
+                                self?.statusText = "Developing \(index + 1) of \(frames.count)…"
+                            }
+                        }
+                    }
+                }.value
+
+                await MainActor.run {
+                    self.statusText = String(format: "Timelapse done — %d frames, largest correction %.2f stops",
+                                             frames.count, biggest)
+                    NSWorkspace.shared.activateFileViewerSelecting([developed])
+                }
+            } catch is CancellationError {
+                await MainActor.run { self.statusText = "Timelapse cancelled" }
+            } catch {
+                await MainActor.run { self.statusText = error.localizedDescription }
+            }
+        }
+    }
+
     /// Shoots an HDR bracket. `automatic` lets the scene decide the count and spacing.
     func captureHDR(automatic: Bool = true) {
         guard isConnected, !isBusy else { return }

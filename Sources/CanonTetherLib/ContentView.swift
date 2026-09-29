@@ -13,6 +13,7 @@ public struct ContentView: View {
     @StateObject private var updateChecker = UpdateChecker()
     @StateObject private var focusStackWindow = FocusStackWindowController()
     @State private var showingPreferences = false
+    @State private var showingTimelapse = false
     /// When on, the filmstrip hides shots with Soft/Borderline focus or Over/Under exposure, showing
     /// only the good ones — a fast triage pass so the photographer's picks come from shots worth
     /// looking at.
@@ -62,6 +63,9 @@ public struct ContentView: View {
             reviewModel.sync(with: newCaptures)
         }
         .toolbar { presenterToolbar }
+        .sheet(isPresented: $showingTimelapse) {
+            TimelapseSheet(viewModel: viewModel)
+        }
         .sheet(isPresented: $showingPreferences) {
             PreferencesView(viewModel: viewModel, reviewModel: reviewModel, analysis: analysis,
                             updateChecker: updateChecker,
@@ -147,6 +151,14 @@ public struct ContentView: View {
             }
             .help("Shoot an exposure bracket in RAW and merge it. Automatic keeps shooting until "
                   + "nothing is clipped or buried in noise; the menu has fixed spreads.")
+            .disabled(!viewModel.isConnected || viewModel.isBusy)
+
+            Button {
+                showingTimelapse = true
+            } label: {
+                Label("Timelapse", systemImage: "timelapse")
+            }
+            .help("Shoot a timelapse, holding the exposure as the light changes")
             .disabled(!viewModel.isConnected || viewModel.isBusy)
 
             toolbarSeparator
@@ -1144,6 +1156,78 @@ private struct OnboardingView: View {
 }
 
 // MARK: - Preferences
+
+private struct TimelapseSheet: View {
+    @ObservedObject var viewModel: CameraViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Timelapse").font(.title2.weight(.semibold))
+
+            // Plain rows rather than `Grid`: the deployment target is older than macOS 13.
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("Interval").frame(width: 92, alignment: .leading)
+                    Stepper(value: $viewModel.timelapseInterval, in: 2...120, step: 1) {
+                        Text("\(Int(viewModel.timelapseInterval)) seconds").monospacedDigit()
+                    }
+                }
+                HStack {
+                    Text("Frames").frame(width: 92, alignment: .leading)
+                    Stepper(value: $viewModel.timelapseFrames, in: 10...5000, step: 10) {
+                        Text("\(viewModel.timelapseFrames)").monospacedDigit()
+                    }
+                }
+                HStack {
+                    Text("ISO ceiling").frame(width: 92, alignment: .leading)
+                    Picker("", selection: $viewModel.timelapseHighestISO) {
+                        ForEach([800.0, 1600, 3200, 6400, 12800], id: \.self) { iso in
+                            Text("ISO \(Int(iso))").tag(iso)
+                        }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                }
+            }
+
+            Text(runtimeSummary)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            Text("Exposure is held as the light changes, moving in the camera's own 1/3-stop "
+                 + "clicks — shutter first, then ISO once the shutter reaches the interval. Every "
+                 + "frame is then developed with the correction that makes those steps invisible, "
+                 + "into a Developed folder beside the RAWs.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Start") {
+                    viewModel.captureTimelapse()
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 460)
+    }
+
+    private var runtimeSummary: String {
+        let seconds = viewModel.timelapseInterval * Double(viewModel.timelapseFrames)
+        let hours = Int(seconds) / 3600, minutes = (Int(seconds) % 3600) / 60
+        let shooting = hours > 0 ? "\(hours)h \(minutes)m" : "\(minutes)m"
+        // 24 fps is the usual delivery rate; saying it in seconds of footage is what the
+        // photographer is actually deciding.
+        let footage = Double(viewModel.timelapseFrames) / 24
+        return String(format: "%@ of shooting — about %.0f seconds of footage at 24 fps",
+                      shooting, footage)
+    }
+}
 
 private struct PreferencesView: View {
     @ObservedObject var viewModel: CameraViewModel

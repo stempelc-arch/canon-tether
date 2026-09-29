@@ -1644,6 +1644,72 @@ Calibrations worth keeping:
 Running past the body's shutter range stops the bracket with what it has rather than failing — the
 frames in hand are a real bracket, just narrower than the scene wanted.
 
+## Timelapse with exposure ramping (2026-09-29)
+
+Toolbar → Timelapse. Holds exposure as the light changes across a day-to-night sequence, then
+develops every frame with the correction that makes the exposure changes invisible.
+
+### Bulb ramping is not available here, and is not the right answer anyway
+
+The classic hardware approach — an external meter driving a bulb timer, so exposure can move in
+arbitrarily small amounts — cannot be reproduced on this rig. **This body exposes no bulb control
+anywhere in its config tree**, and the PTP/IP link's command latency runs 0.2 s to over 2 s, so
+timing a bulb exposure to the tens of milliseconds smooth ramping needs is not possible.
+
+It is also unnecessary. That device needed continuously-variable exposure because it committed to a
+rendered image at capture time. Here every frame is RAW with its exact exposure in EXIF, so the step
+can be taken in the body's own 1/3-stop clicks and **removed afterwards**: a frame shot 1/3 stop
+darker is developed 1/3 stop brighter and the seam disappears. That also corrects two things bulb
+ramping cannot — shutter timing error, and the light changing between one frame and the next.
+
+### The controller
+
+`ExposureRamp` holds exposure roughly right and changes it as rarely as possible, because every
+change is something the deflicker pass has to undo. Four things earn their place, each with a
+failure mode behind it: a **deadband** (without it a reading hovering at the boundary toggles the
+exposure every frame — many small seams instead of a few clean ones), a **one-click rate limit**
+(a large correction stretches noise and highlight roll-off differently from its neighbours, which no
+gain can undo), **smoothing** (so headlights or a bird do not drive a permanent change), and
+**crediting each correction immediately** against the error — without it the controller keeps seeing
+an error it has already answered and over-corrects by several clicks, which reads as the exposure
+surging past the light and coming back.
+
+Measured against a simulated 10-stop sunset over 600 frames: holds within a stop, ~30 clicks.
+
+**The deflicker smooths the *rendered* sequence.** The first version divided the exposure back out to
+recover the scene's own light and smoothed that, which does nothing at all — dividing out the
+exposure removes precisely the steps that need correcting, leaving a curve that is smooth by
+construction. The window must also be wider than the gap between exposure changes, or a step is
+merely softened rather than spread.
+
+### Shutter first, then ISO, never aperture
+
+`ExposureLadder` turns "a third of a stop more" into settings the body will take. Going brighter it
+lengthens the shutter up to the interval and only then raises ISO; going darker it brings ISO back
+to base before shortening the shutter, so the sequence returns to base ISO as soon as the light
+allows. **Aperture never ramps** — the iris does not return to exactly the same position shot to
+shot, so ramping it introduces the very flicker the feature exists to remove, and would change depth
+of field through the sequence.
+
+Running out in either direction returns `nil` rather than silently holding, so a night ramp reports
+that it has reached the end of its range.
+
+### Metering, and frame timing
+
+Brightness is the **70th percentile** of linear luminance, not the mean: the mean of a landscape is
+dominated by whichever of sky and ground is larger, so a slightly different framing meters
+differently for no visible reason. The target is set by the **first frame** — the photographer
+framed and metered it, and the ramp's job is to hold that look rather than impose one.
+
+Frames fire on the interval's *grid* rather than sleeping a fixed gap after each one: metering and
+downloading take a variable time, and a fixed gap makes the sequence drift and its motion uneven.
+
+Corrected 16-bit TIFFs are written to a `Developed` folder beside the RAWs. The gain is applied as
+`CIRAWFilter.exposure`, in **linear light before rendering** — a gain applied to already-rendered
+values lightens shadows and highlights by different amounts and leaves a different seam behind.
+
+Covered by `ExposureRampTests` and two `swiftc` harnesses (12 + 17 checks). Unverified on the camera.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).

@@ -39,7 +39,13 @@ enum CaptureLocation {
     /// real shots. Only the suffix and the merged file's name differ.
     static let hdrFolderSuffix = " HDR"
 
-    static let groupFolderSuffixes = [stackFolderSuffix, hdrFolderSuffix]
+    static let groupFolderSuffixes = [stackFolderSuffix, hdrFolderSuffix, timelapseFolderSuffix]
+
+    static let timelapseFolderSuffix = " Timelapse"
+
+    static func timelapseFolderName(for date: Date) -> String {
+        DateFormatter.captureFilenameFormatter.string(from: date) + timelapseFolderSuffix
+    }
 
     static func hdrFolderName(for date: Date) -> String {
         DateFormatter.captureFilenameFormatter.string(from: date) + hdrFolderSuffix
@@ -2086,6 +2092,131 @@ actor GPhotoSession {
         let frames: [URL]
         /// Index of the metered frame, which the merge anchors to.
         let referenceIndex: Int
+    }
+
+    // MARK: - Timelapse
+
+    struct TimelapseFrame {
+        let url: URL
+        let exposure: Double        // relative, from EXIF
+        let brightness: Double      // measured, linear
+    }
+
+    struct TimelapseResult {
+        let folder: URL
+        let frames: [TimelapseFrame]
+    }
+
+    /// Shoots a timelapse, holding exposure as the light changes.
+    ///
+    /// Exposure is ramped in the body's own 1/3-stop clicks and the steps are removed afterwards;
+    /// see `ExposureRamp` for why that beats the bulb-timer approach on this camera. Each frame is
+    /// metered as it lands, so the ramp follows the light rather than a clock.
+    func captureTimelapse(intervalSeconds: Double,
+                          frameCount: Int,
+                          highestISO: Double,
+                          status: @escaping @Sendable (String) -> Void) async throws -> TimelapseResult {
+        try await withTetherPaused {
+            try await withRAWCapture {
+                try await captureTimelapseInner(intervalSeconds: intervalSeconds,
+                                                frameCount: frameCount,
+                                                highestISO: highestISO,
+                                                status: status)
+            }
+        }
+    }
+
+    private func captureTimelapseInner(intervalSeconds: Double,
+                                       frameCount: Int,
+                                       highestISO: Double,
+                                       status: @escaping @Sendable (String) -> Void) async throws -> TimelapseResult {
+        let shutterOutput = try await getConfig(ExposureGrid.shutterPath)
+        let isoOutput = try await getConfig(ExposureGrid.isoPath)
+        guard let shutterSetting = CameraSetting.parse(from: shutterOutput, path: ExposureGrid.shutterPath),
+              let isoSetting = CameraSetting.parse(from: isoOutput, path: ExposureGrid.isoPath),
+              !shutterSetting.readOnly, !isoSetting.readOnly else {
+            throw GPhotoError.commandFailed("The camera won't let shutter and ISO be set — take it off a fully automatic mode.")
+        }
+        // The shutter may never outlast the interval; leave room for the download too.
+        let ladder = ExposureLadder(shutterChoices: shutterSetting.choices,
+                                    isoChoices: isoSetting.choices,
+                                    longestShutter: Swift.max(intervalSeconds - 2, 0.5),
+                                    highestISO: highestISO)
+        var current = ExposureLadder.Settings(shutter: shutterSetting.current, iso: isoSetting.current)
+
+        let folder = captureDirectory.appendingPathComponent(CaptureLocation.timelapseFolderName(for: Date()))
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        stackGroupDirectory = folder
+        defer { stackGroupDirectory = nil }
+
+        let release = try await releaseValues()
+        var ramp = ExposureRamp()
+        var frames: [TimelapseFrame] = []
+        var target: Double?
+        let startedAt = Date()
+
+        do {
+            for index in 0..<frameCount {
+                try Task.checkCancellation()
+                // Fire on the interval's grid rather than sleeping a fixed gap after each frame:
+                // metering and downloading take a variable amount of time, and a fixed gap makes
+                // the sequence drift and the motion in it uneven.
+                let due = startedAt.addingTimeInterval(Double(index) * intervalSeconds)
+                let wait = due.timeIntervalSinceNow
+                if wait > 0 { try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
+
+                status("Timelapse \(index + 1) of \(frameCount) — \(current.shutter), ISO \(current.iso)")
+                try await withCommandLock { try await releaseShutterLocked(release) }
+                let arrived = try await withCommandLock { await drainDownloadsLocked(expected: 1) }
+                guard let url = arrived.first else {
+                    log("timelapse: frame \(index + 1) didn't arrive — carrying on")
+                    continue
+                }
+
+                let measured = await Task.detached(priority: .userInitiated) {
+                    (brightness: HDRRenderer.rampBrightness(of: url),
+                     exposure: HDRRenderer.relativeExposure(of: url))
+                }.value
+                guard let brightness = measured.brightness, brightness > 0 else { continue }
+                frames.append(TimelapseFrame(url: url,
+                                             exposure: measured.exposure ?? 1,
+                                             brightness: brightness))
+
+                // The first usable frame sets what "correctly exposed" means for this sequence.
+                // Anchoring to the photographer's own starting exposure beats any fixed target:
+                // they framed and metered it, and the ramp's job is to keep that look, not to
+                // impose one.
+                if target == nil { target = brightness }
+                guard let target else { continue }
+                ramp.record(stopsFromTarget: log2(brightness / target))
+                let adjustment = ramp.nextAdjustment()
+                guard adjustment != 0 else { continue }
+                guard let next = ladder.settings(from: current, changingBy: adjustment) else {
+                    log("timelapse: out of exposure range — holding at \(current.shutter), ISO \(current.iso)")
+                    status("Exposure range reached — holding")
+                    continue
+                }
+                try await withCommandLock {
+                    try await setConfigLocked(ExposureGrid.shutterPath, next.shutter)
+                    _ = await confirmShutterLocked(next.shutter)
+                    if next.iso != current.iso {
+                        try await setConfigLocked(ExposureGrid.isoPath, next.iso)
+                    }
+                }
+                log(String(format: "timelapse: frame %d — %+.2f stops -> %@ ISO %@",
+                           index + 1, adjustment, next.shutter, next.iso))
+                current = next
+            }
+        } catch {
+            await restoreShutter(shutterSetting.current)
+            try? await setConfig(ExposureGrid.isoPath, isoSetting.current)
+            throw error
+        }
+        await restoreShutter(shutterSetting.current)
+        try? await setConfig(ExposureGrid.isoPath, isoSetting.current)
+
+        log("timelapse: \(frames.count) frames, \(ramp.adjustments) exposure changes")
+        return TimelapseResult(folder: folder, frames: frames)
     }
 
     /// Shoots exposures until the scene is covered, deciding the count and spacing from what each
