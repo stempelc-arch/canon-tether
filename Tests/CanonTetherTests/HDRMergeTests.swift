@@ -75,7 +75,7 @@ final class HDRMergeTests: XCTestCase {
         func frame(_ exposure: Double) -> HDRMerge.Frame {
             var image = StackImage(width: width, height: 1, channels: 1)
             for i in 0..<width {
-                image.data[i] = HDRMerge.encode(min(scene[i] * Float(exposure), 1))
+                image.data[i] = min(scene[i] * Float(exposure), 1)   // linear, clipped at this frame's white
             }
             return HDRMerge.Frame(image: image, exposure: exposure)
         }

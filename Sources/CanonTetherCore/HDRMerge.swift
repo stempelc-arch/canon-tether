@@ -19,9 +19,10 @@ public enum HDRMerge {
 
     /// sRGB's electro-optical transfer function — encoded value to linear light.
     ///
-    /// Frames arrive gamma-encoded. Averaging them in that space is simply wrong: a stop of
-    /// exposure is a factor of two in *light*, not in code value, and blending encoded values makes
-    /// the midtones drift in a way no amount of curve-tweaking afterwards can undo.
+    /// Used to bring a JPEG source into the linear space the merge works in, and to judge
+    /// well-exposedness. Combining frames in encoded space is simply wrong: a stop of exposure is a
+    /// factor of two in *light*, not in code value, and blending encoded values makes the midtones
+    /// drift in a way no amount of curve-tweaking afterwards can undo.
     public static func linearize(_ encoded: Float) -> Float {
         let v = min(max(encoded, 0), 1)
         return v <= 0.04045 ? v / 12.92 : powf((v + 0.055) / 1.055, 2.4)
@@ -59,8 +60,17 @@ public enum HDRMerge {
 
     // MARK: - Merging
 
-    /// One frame of the bracket.
+    /// One frame of the bracket, in **linear light**.
+    ///
+    /// Linear, not gamma-encoded, because that is what the RAW pipeline actually offers and what
+    /// this feature exists to exploit. Measured on a real CR2 from this camera: ImageIO's decode
+    /// returns **8 bits per component and clips at white**, discarding precisely what shooting RAW
+    /// is for, while `CIRAWFilter` in a linear working space with Apple's boost curve disabled
+    /// returns float data peaking at **1.56** — real highlight headroom above white. A JPEG source
+    /// simply gets linearised on the way in.
     public struct Frame {
+        /// Linear radiance as captured, where 1.0 is this frame's white point. Values above 1.0 are
+        /// allowed and are the whole point on a RAW source.
         public let image: StackImage
         /// Relative exposure: how much light this frame collected, compared with any other frame.
         ///
@@ -111,9 +121,12 @@ public enum HDRMerge {
             var brightestUsable: Float = 0     // from the least-exposed frame: highlight detail
             var darkestUsable: Float = .greatestFiniteMagnitude
             for (index, frame) in frames.enumerated() {
-                let encoded = frame.image.data[i]
-                let radiance = linearize(encoded) / scales[index]
-                let weight = reliability(of: encoded)
+                let linear = frame.image.data[i]
+                let radiance = linear / scales[index]
+                // Well-exposedness is judged on the *encoded* position, not the linear one.
+                // Linear light puts a midtone at about 0.18, so weighting there would call most of
+                // a correctly-exposed frame "nearly black" and throw away its best data.
+                let weight = reliability(of: encode(min(linear, 1)))
                 if weight > 0 {
                     weighted += radiance * weight
                     total += weight
@@ -128,7 +141,7 @@ public enum HDRMerge {
                 // is brighter than the bracket reached, so take the brightest estimate; black in
                 // all of them means it really is that dark. Guessing beyond the bracket is how a
                 // merge invents detail that was never photographed.
-                let allClipped = frames.allSatisfy { $0.image.data[i] >= 1 - deadZone }
+                let allClipped = frames.allSatisfy { $0.image.data[i] >= 1 - Float(deadZone) }
                 out.data[i] = allClipped ? brightestUsable
                                          : (darkestUsable == .greatestFiniteMagnitude ? 0 : darkestUsable)
             }
