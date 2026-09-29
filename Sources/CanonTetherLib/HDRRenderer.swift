@@ -248,6 +248,60 @@ enum HDRRenderer {
         return HDRToneCurve(linear: linear, rendered: rendered, channels: 3)
     }
 
+    /// What one exposure recorded: how much it lost at each end.
+    ///
+    /// Read at low resolution — this decides whether to shoot another frame, and the answer is a
+    /// fraction of the picture, not a per-pixel judgement. A full decode per probe would add
+    /// seconds to every bracket for no change in the decision.
+    static func coverage(of url: URL) -> HDRAutoBracket.Coverage? {
+        guard let filter = CIRAWFilter(imageURL: url) else { return nil }
+        filter.boostAmount = 0
+        filter.isGamutMappingEnabled = false
+        guard let image = filter.outputImage else { return nil }
+        let linearSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
+        let context = CIContext(options: [.workingColorSpace: linearSpace,
+                                          .outputColorSpace: linearSpace,
+                                          .cacheIntermediates: false])
+        let edge: CGFloat = 500
+        let scale = edge / image.extent.width
+        let small = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let w = Int(small.extent.width), h = Int(small.extent.height)
+        guard w > 0, h > 0 else { return nil }
+        var buffer = [Float](repeating: 0, count: w * h * 4)
+        buffer.withUnsafeMutableBytes { raw in
+            context.render(small, toBitmap: raw.baseAddress!, rowBytes: w * 16,
+                           bounds: small.extent, format: .RGBAf, colorSpace: linearSpace)
+        }
+
+        var clipped = 0, crushed = 0
+        let total = w * h
+        for pixel in 0..<total {
+            let r = buffer[pixel * 4], g = buffer[pixel * 4 + 1], bch = buffer[pixel * 4 + 2]
+            // Clipped if *any* channel has run out: a blown red leaves the pixel's colour wrong even
+            // where the others still hold detail.
+            if r >= clipLevel || g >= clipLevel || bch >= clipLevel { clipped += 1 }
+            // Crushed on luminance rather than per channel — a deep blue shadow is not a fault.
+            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * bch
+            if luma < noiseFloor { crushed += 1 }
+        }
+        return HDRAutoBracket.Coverage(clipped: Double(clipped) / Double(total),
+                                       crushed: Double(crushed) / Double(total))
+    }
+
+    /// Linear value at which a frame is out of highlight information.
+    ///
+    /// 1.0 is this frame's white point. `CIRAWFilter` does return values above it, reconstructed
+    /// from whichever channels had not yet saturated, but that reconstruction is a guess about
+    /// colour — it is exactly what a darker frame in the bracket exists to replace.
+    static let clipLevel: Float = 1.0
+
+    /// Linear luminance below which there is nothing worth merging.
+    ///
+    /// About nine stops under the frame's white point. Below that this sensor's read noise is a
+    /// large share of the signal at the ISOs a tethered shoot uses, and a brighter exposure is the
+    /// only thing that helps.
+    static let noiseFloor: Float = 0.002
+
     /// Relative exposure from EXIF: how much light this frame collected, on an arbitrary but
     /// consistent scale. Only ratios matter to the merge.
     static func relativeExposure(of url: URL) -> Double? {

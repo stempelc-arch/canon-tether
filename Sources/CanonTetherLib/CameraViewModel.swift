@@ -438,17 +438,21 @@ final class CameraViewModel: ObservableObject {
     /// resolution RAW, and the same lesson as the focus-stack merge applies — saturating the
     /// machine at a higher priority starves the live-view decode and freezes the UI, which is
     /// indistinguishable from a hang.
-    func captureHDR() {
+    /// Shoots an HDR bracket. `automatic` lets the scene decide the count and spacing.
+    func captureHDR(automatic: Bool = true) {
         guard isConnected, !isBusy else { return }
         let plan = HDRPlan(spread: hdrSpread)
         isBusy = true
-        statusText = "HDR — \(plan.summary(metered: nil))"
+        statusText = automatic ? "HDR — measuring the scene…" : "HDR — \(plan.summary(metered: nil))"
         Task {
             defer { Task { @MainActor in self.isBusy = false } }
             do {
-                let result = try await session.captureHDRBracket(plan: plan) { message in
+                let report: @Sendable (String) -> Void = { message in
                     Task { @MainActor [weak self] in self?.statusText = message }
                 }
+                let result = automatic
+                    ? try await session.captureAutoHDRBracket(status: report)
+                    : try await session.captureHDRBracket(plan: plan, status: report)
                 await MainActor.run { self.statusText = "Merging \(result.frames.count) exposures…" }
 
                 let output = result.folder.appendingPathComponent(

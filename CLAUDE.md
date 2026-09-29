@@ -1606,6 +1606,44 @@ steepest and the darkest frame's own noise is amplified by the 16x exposure scal
 try is weighting by noise as well as well-exposedness, so a bright region prefers the frame that
 photographed it at a higher signal level.
 
+### Automatic bracketing: shoot until the scene is covered (2026-09-29)
+
+Toolbar → HDR now measures rather than guesses. A fixed ±2 or ±4 is a guess about a scene nobody has
+looked at: it wastes frames on an evenly-lit subject and falls short of a window in a dark room.
+`HDRAutoBracket` shoots the metered exposure, measures what it lost at each end, and walks outward
+until nothing important is still clipping or still in the noise. The fixed spreads remain in the
+menu.
+
+Per frame, `HDRRenderer.coverage` reads two fractions off a 500 px linear decode: **clipped** (any
+channel at or above the frame's white point — a blown red leaves the colour wrong even where the
+other channels hold) and **crushed** (luminance under `noiseFloor`, about nine stops down, judged on
+luminance because a deep blue shadow is not a fault).
+
+Measured on the real window-in-a-room bracket:
+
+    1/2000 (-4)   clipped  0.000%   crushed 77.3%
+    1/125  ( 0)   clipped 12.109%   crushed 25.6%
+    1/8    (+4)   clipped 26.099%   crushed  0.0%
+
+which walks to −4…+4 in two-stop steps: five exposures, filling the gaps a manual ±4 leaves.
+
+Calibrations worth keeping:
+- **`clippedTarget` is 0.1%, not zero.** A specular reflection off glass or metal has no detail to
+  recover at any exposure, and chasing it would add frames forever.
+- **`crushedTarget` is looser (2%)** because deep shadow is often *meant* to be black — but it errs
+  toward shooting the extra frame, since a noisy floor cannot be fixed afterwards and a spare
+  exposure costs seconds.
+- **Two-stop steps.** The merge weights samples by how well exposed they are and needs each tone to
+  appear usably in more than one frame; four stops meet only at the edges of each frame's usable
+  band, where the weighting is weakest and the noise worst.
+- **Highlights are extended before shadows.** A blown highlight is unrecoverable and obvious; a
+  noisy shadow is neither, so when the frame cap bites, the dark end is the better place to have
+  spent frames.
+- Only the *outermost* frames decide. A clipping middle frame is already covered by a darker one.
+
+Running past the body's shutter range stops the bracket with what it has rather than failing — the
+frames in hand are a real bracket, just narrower than the scene wanted.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).

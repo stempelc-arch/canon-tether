@@ -2088,6 +2088,94 @@ actor GPhotoSession {
         let referenceIndex: Int
     }
 
+    /// Shoots exposures until the scene is covered, deciding the count and spacing from what each
+    /// frame actually records.
+    ///
+    /// A fixed ±2 or ±4 is a guess about a scene nobody has looked at: it wastes frames on an evenly
+    /// lit subject and falls short of a window in a dark room. This shoots the metered exposure,
+    /// measures what it lost at each end, and walks outward until nothing important is still
+    /// clipping or still in the noise.
+    func captureAutoHDRBracket(status: @escaping @Sendable (String) -> Void) async throws -> HDRBracketResult {
+        try await withTetherPaused {
+            try await withRAWCapture {
+                try await captureAutoHDRBracketInner(status: status)
+            }
+        }
+    }
+
+    private func captureAutoHDRBracketInner(status: @escaping @Sendable (String) -> Void) async throws -> HDRBracketResult {
+        let output = try await getConfig(ExposureGrid.shutterPath)
+        guard let setting = CameraSetting.parse(from: output, path: ExposureGrid.shutterPath),
+              !setting.readOnly else {
+            throw GPhotoError.commandFailed("The camera won't let the shutter speed be set — take it off a fully automatic mode.")
+        }
+        let metered = setting.current
+        let folder = captureDirectory.appendingPathComponent(CaptureLocation.hdrFolderName(for: Date()))
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        stackGroupDirectory = folder
+        defer { stackGroupDirectory = nil }
+
+        let release = try await releaseValues()
+        var shot: [(offset: Int, coverage: HDRAutoBracket.Coverage)] = []
+        var urlsByOffset: [Int: URL] = [:]
+        var lastCoverage = HDRAutoBracket.Coverage(clipped: 0, crushed: 0)
+
+        do {
+            while let offset = HDRAutoBracket.next(after: shot) {
+                try Task.checkCancellation()
+                // Out of the body's range is a reason to stop, not to fail: the frames already in
+                // hand are a real bracket, just a narrower one than the scene wanted.
+                guard let speed = HDRPlan.shutter(stopsFrom: metered, stops: offset, in: setting.choices) else {
+                    log("hdr auto: \(offset >= 0 ? "+" : "")\(offset) stops is past this body's shutter range — stopping")
+                    status("Shutter range reached — bracketing with what fits")
+                    break
+                }
+                status("HDR \(shot.count + 1) — \(speed) (\(offset >= 0 ? "+" : "")\(offset) stops)")
+                try await withCommandLock {
+                    try await setConfigLocked(ExposureGrid.shutterPath, speed)
+                    guard await confirmShutterLocked(speed) else {
+                        throw GPhotoError.commandFailed("The camera didn't take \(speed).")
+                    }
+                    try await releaseShutterLocked(release)
+                }
+                let arrived = try await withCommandLock { await drainDownloadsLocked(expected: 1) }
+                guard let url = arrived.first else {
+                    throw GPhotoError.commandFailed("An exposure didn't arrive from the camera.")
+                }
+                urlsByOffset[offset] = url
+
+                // Measured off the actor: it is a decode, and the session is what every other
+                // camera command needs.
+                let coverage = await Task.detached(priority: .userInitiated) {
+                    HDRRenderer.coverage(of: url)
+                }.value ?? HDRAutoBracket.Coverage(clipped: 0, crushed: 0)
+                lastCoverage = coverage
+                shot.append((offset, coverage))
+                log(String(format: "hdr auto: %+d stops — clipped %.3f%%, crushed %.1f%%",
+                           offset, coverage.clipped * 100, coverage.crushed * 100))
+            }
+        } catch {
+            await restoreShutter(metered)
+            throw error
+        }
+        await restoreShutter(metered)
+
+        guard shot.count >= 2 else {
+            throw GPhotoError.commandFailed(
+                "This scene fits in a single exposure — no bracket was needed.")
+        }
+        let offsets = shot.map(\.offset).sorted()
+        log("hdr auto: \(HDRAutoBracket.summary(offsets: offsets))")
+        if let warning = HDRAutoBracket.warning(offsets: offsets, last: lastCoverage) {
+            log("hdr auto: \(warning)")
+            status(warning)
+        }
+        // Darkest first, and the metered frame is what the merge anchors to.
+        let ordered = offsets.compactMap { urlsByOffset[$0] }
+        let reference = offsets.firstIndex(of: 0) ?? offsets.count / 2
+        return HDRBracketResult(folder: folder, frames: ordered, referenceIndex: reference)
+    }
+
     /// Shoots an exposure bracket: the metered exposure plus one darker and one brighter frame.
     ///
     /// The tether watch is paused throughout, as for a focus bracket — it would only compete for the
