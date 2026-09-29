@@ -1737,6 +1737,28 @@ Two defences, either of which would have prevented it:
 the failure looked like the camera's fault — the very thing the "silent camera isn't broken" note
 warns about, in the opposite direction.
 
+### A download wait must outlast the exposure (2026-09-29)
+
+Automatic HDR "wasn't getting the whole range". It was stopping one frame short, every time, in the
+one place it mattered:
+
+    13:22:40.841  set shutterspeed=1.6      the +4 frame, a 1.6-second exposure
+    13:22:43.242  restore to 1/10           gave up
+    13:22:45.059  tether: downloaded 1 camera-shutter frame(s)   <- it arrived, late
+
+`drainDownloadsLocked` counts three empty 600 ms rounds — about 1.8 s of patience — starting the
+moment the shutter is released. A 1.6-second exposure has barely *finished* by then, so the frame is
+declared missing and the bracket abandons precisely the long exposures it exists to take. The shadows
+it was extending for stayed crushed, and the frame turned up afterwards in the tether watch.
+
+The wait now starts counting only after `exposureSeconds + downloadSlack`. **A frame cannot arrive
+before it has finished being taken**, so silence before then carries no information at all. Every
+bracket path passes the shutter speed it just used; the timelapse does too, where night frames get
+long.
+
+**Watch for this shape generally:** a timeout calibrated on short operations, applied to a feature
+whose whole purpose is the long ones.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).

@@ -94,6 +94,9 @@ enum GPhotoError: LocalizedError {
     case binaryNotFound
     case noCameraDetected
     case commandFailed(String)
+    /// The camera needs changing before this can work. Carries the whole message, because unlike a
+    /// gphoto2 failure there is nothing technical worth showing the photographer — only what to do.
+    case needsCameraChange(String)
 
     var errorDescription: String? {
         switch self {
@@ -101,6 +104,8 @@ enum GPhotoError: LocalizedError {
             return "gphoto2 not found. Install it with: brew install libgphoto2 gphoto2"
         case .noCameraDetected:
             return "No camera detected. Check the USB/network connection."
+        case .needsCameraChange(let message):
+            return message
         case .commandFailed(let output):
             return "gphoto2 command failed:\n\(output)"
         }
@@ -2137,6 +2142,19 @@ actor GPhotoSession {
         let referenceIndex: Int
     }
 
+    /// Rejects a shutter setting the exposure maths cannot work with, before anything is shot.
+    ///
+    /// **Bulb is the case that matters.** On Bulb the body reports a shutter of "bulb", which is not
+    /// a duration, so every offset a bracket asks for resolves to nothing and the whole sequence
+    /// ends before the first frame — with a message about the *scene* not needing a bracket, which
+    /// is both wrong and unactionable. Observed exactly that: the button appeared to do nothing.
+    private func requireTimedShutter(_ setting: CameraSetting) throws {
+        guard ExposureGrid.stops(of: setting.current, path: ExposureGrid.shutterPath) == nil else { return }
+        throw GPhotoError.needsCameraChange(
+            "The camera's shutter is set to \(setting.current). Bracketing needs a timed shutter "
+            + "speed — set one on the camera (take it off Bulb) and try again.")
+    }
+
     // MARK: - Timelapse
 
     struct TimelapseFrame {
@@ -2180,6 +2198,7 @@ actor GPhotoSession {
               !shutterSetting.readOnly, !isoSetting.readOnly else {
             throw GPhotoError.commandFailed("The camera won't let shutter and ISO be set — take it off a fully automatic mode.")
         }
+        try requireTimedShutter(shutterSetting)
         // The shutter may never outlast the interval; leave room for the download too.
         let ladder = ExposureLadder(shutterChoices: shutterSetting.choices,
                                     isoChoices: isoSetting.choices,
@@ -2210,7 +2229,10 @@ actor GPhotoSession {
 
                 status("Timelapse \(index + 1) of \(frameCount) — \(current.shutter), ISO \(current.iso)")
                 try await withCommandLock { try await releaseShutterLocked(release) }
-                let arrived = try await withCommandLock { await drainDownloadsLocked(expected: 1) }
+                let arrived = try await withCommandLock {
+                    await drainDownloadsLocked(expected: 1,
+                                               exposureSeconds: ExposureGrid.seconds(from: current.shutter) ?? 0)
+                }
                 guard let url = arrived.first else {
                     log("timelapse: frame \(index + 1) didn't arrive — carrying on")
                     continue
@@ -2283,6 +2305,7 @@ actor GPhotoSession {
               !setting.readOnly else {
             throw GPhotoError.commandFailed("The camera won't let the shutter speed be set — take it off a fully automatic mode.")
         }
+        try requireTimedShutter(setting)
         let metered = setting.current
         let folder = captureDirectory.appendingPathComponent(CaptureLocation.hdrFolderName(for: Date()))
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -2312,9 +2335,13 @@ actor GPhotoSession {
                     }
                     try await releaseShutterLocked(release)
                 }
-                let arrived = try await withCommandLock { await drainDownloadsLocked(expected: 1) }
+                let seconds = ExposureGrid.seconds(from: speed) ?? 0
+                let arrived = try await withCommandLock {
+                    await drainDownloadsLocked(expected: 1, exposureSeconds: seconds)
+                }
                 guard let url = arrived.first else {
-                    throw GPhotoError.commandFailed("An exposure didn't arrive from the camera.")
+                    throw GPhotoError.commandFailed(
+                        "The \(speed) exposure didn't arrive from the camera.")
                 }
                 urlsByOffset[offset] = url
 
@@ -2335,8 +2362,12 @@ actor GPhotoSession {
         await restoreShutter(metered)
 
         guard shot.count >= 2 else {
-            throw GPhotoError.commandFailed(
-                "This scene fits in a single exposure — no bracket was needed.")
+            // Distinguish "one exposure was enough" from "nothing was shot at all" — the second is
+            // a setup problem and saying the scene was easy sends the photographer looking in the
+            // wrong place entirely.
+            throw GPhotoError.needsCameraChange(shot.isEmpty
+                ? "No exposures were taken — the camera wouldn't accept the shutter speeds this bracket needs."
+                : "This scene fits in a single exposure — no bracket was needed.")
         }
         let offsets = shot.map(\.offset).sorted()
         log("hdr auto: \(HDRAutoBracket.summary(offsets: offsets))")
@@ -2371,6 +2402,7 @@ actor GPhotoSession {
               !setting.readOnly else {
             throw GPhotoError.commandFailed("The camera won't let the shutter speed be set — take it off a fully automatic mode.")
         }
+        try requireTimedShutter(setting)
         let metered = setting.current
         guard let speeds = plan.shutterSpeeds(metered: metered, choices: setting.choices) else {
             throw GPhotoError.commandFailed(
@@ -2412,7 +2444,8 @@ actor GPhotoSession {
                     try await releaseShutterLocked(release)
                 }
                 captured.append(contentsOf: try await withCommandLock {
-                    await drainDownloadsLocked(expected: 1)
+                    await drainDownloadsLocked(expected: 1,
+                                               exposureSeconds: ExposureGrid.seconds(from: speed) ?? 0)
                 })
             }
         } catch {
@@ -2451,6 +2484,9 @@ actor GPhotoSession {
         log("hdr: shutter did not reach \(speed)")
         return false
     }
+
+    /// Grace beyond the exposure itself, for the camera to write and hand the file over.
+    static let downloadSlack: Double = 2.5
 
     static let shutterConfirmAttempts = 10
     static let shutterConfirmInterval: UInt64 = 200_000_000
@@ -2568,10 +2604,19 @@ actor GPhotoSession {
     }
 
     /// Collects frames the camera is holding, until `expected` have arrived or it goes quiet.
-    private func drainDownloadsLocked(expected: Int) async -> [URL] {
+    /// - Parameter exposureSeconds: how long the shutter was open. The wait must outlast the
+    ///   exposure itself: a frame cannot arrive before it has finished being taken, and counting
+    ///   "quiet" rounds from the moment of release abandons every long exposure.
+    ///
+    ///   This bit hard. An automatic HDR bracket reached its +4 frame at 1.6 s, waited its three
+    ///   empty 600 ms rounds — 1.8 s, barely past the exposure — gave up, and the frame then landed
+    ///   in the tether watch two seconds later. The bracket stopped exactly where the scene needed
+    ///   it to keep going, so the shadows it was extending for stayed crushed.
+    private func drainDownloadsLocked(expected: Int, exposureSeconds: Double = 0) async -> [URL] {
         var collected: [URL] = []
         var quietRounds = 0
-        let deadline = Date().addingTimeInterval(Self.downloadTimeout * 2)
+        let patientUntil = Date().addingTimeInterval(exposureSeconds + Self.downloadSlack)
+        let deadline = Date().addingTimeInterval(Self.downloadTimeout * 2 + exposureSeconds)
         while collected.count < expected, Date() < deadline {
             guard let output = try? await sendCommandLocked(
                 "wait-event-and-download 600ms",
@@ -2581,6 +2626,8 @@ actor GPhotoSession {
             ) else { break }
             let names = CaptureOutput.savedFilenames(in: output)
             if names.isEmpty {
+                // Silence before the exposure can possibly have finished means nothing at all.
+                if Date() < patientUntil { continue }
                 quietRounds += 1
                 // The camera has nothing more to give; a longer wait only delays the result.
                 if quietRounds >= 3 { break }
