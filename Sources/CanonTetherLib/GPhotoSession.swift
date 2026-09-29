@@ -2132,10 +2132,21 @@ actor GPhotoSession {
                 status("HDR \(index + 1) of \(speeds.count) — \(speed)")
                 try await withCommandLock {
                     try await setConfigLocked(ExposureGrid.shutterPath, speed)
-                    // Let the body settle on the new speed before releasing: a shutter change and a
-                    // release in the same breath has been seen to fire at the previous setting,
-                    // which silently produces two frames at one exposure and a bracket with a hole.
-                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    // **Read it back before firing.** A fixed settle is a guess, and it was wrong:
+                    // measured on this body, a two-stop change lands inside 250 ms but a four-stop
+                    // one does not. A ±4 bracket therefore fired every frame at the *previous*
+                    // frame's speed — planned 1/1000, 1/60, 1/4 and shot 1/1000, 1/1000, 1/60,
+                    // which is a duplicate dark frame, half the intended spread, and a merge
+                    // anchored to the wrong exposure. Nothing in the log said so, because every
+                    // command had succeeded.
+                    //
+                    // Same lesson as `restoreImageFormat` and `restoreShutter`: the camera
+                    // acknowledging a setting is not the camera having applied it. Only a read
+                    // proves anything.
+                    guard await confirmShutterLocked(speed) else {
+                        throw GPhotoError.commandFailed(
+                            "The camera didn't take \(speed) — it stayed on a different shutter speed.")
+                    }
                     try await releaseShutterLocked(release)
                 }
                 captured.append(contentsOf: try await withCommandLock {
@@ -2153,6 +2164,34 @@ actor GPhotoSession {
         }
         return HDRBracketResult(folder: folder, frames: captured, referenceIndex: plan.referenceIndex)
     }
+
+    /// Waits until the body reports the shutter speed actually asked for.
+    ///
+    /// Polls rather than sleeping a fixed time, because how long a change takes depends on how far
+    /// it is: four stops is slower than two, and any constant is wrong for one of them.
+    private func confirmShutterLocked(_ speed: String) async -> Bool {
+        for attempt in 0..<Self.shutterConfirmAttempts {
+            if attempt > 0 {
+                try? await Task.sleep(nanoseconds: Self.shutterConfirmInterval)
+            } else {
+                // Give it one settle before the first read; asking immediately just wastes a
+                // round trip on the common case.
+                try? await Task.sleep(nanoseconds: Self.shutterConfirmInterval)
+            }
+            guard let output = try? await sendCommandLocked(
+                    "get-config \(ExposureGrid.shutterPath)",
+                    doneMarkers: ["END", "*** Error", "ERROR"],
+                    timeout: 15, quiet: true),
+                  let setting = CameraSetting.parse(from: output, path: ExposureGrid.shutterPath)
+            else { continue }
+            if setting.current == speed { return true }
+        }
+        log("hdr: shutter did not reach \(speed)")
+        return false
+    }
+
+    static let shutterConfirmAttempts = 10
+    static let shutterConfirmInterval: UInt64 = 200_000_000
 
     /// Puts the shutter back where the photographer left it.
     ///

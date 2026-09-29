@@ -1524,6 +1524,44 @@ bracket exists to recover. If a frame moves, reshoot.
 Covered by `HDRMergeTests`, `HDRPlanTests`, and two `swiftc` harnesses (78 + 15 checks). The renderer
 is verified on real CR2s; the *bracket* is unverified until it runs on the camera.
 
+### A shutter change must be read back before firing (2026-09-29)
+
+First real HDR brackets. The ±2 shot exactly as planned; the ±4 did not:
+
+    planned  1/1000  1/60    1/4
+    shot     1/1000  1/1000  1/60
+
+Every frame after the first fired at the **previous** frame's speed — a duplicate dark frame, half
+the intended spread, and the merge anchored to the wrong exposure. Nothing in the log said so,
+because every command had succeeded.
+
+The cause was a fixed 250 ms settle between `set-config shutterspeed` and the release. Measured on
+this body a two-stop change lands inside it and a four-stop change does not, which is why the
+narrower bracket looked fine and hid the bug. `confirmShutterLocked` now polls `get-config` until
+the body reports the speed actually asked for, and the bracket fails loudly if it never does.
+
+**Third time this lesson has been paid for here** (`restoreImageFormat`, `restoreShutter`, now this):
+the camera acknowledging a setting is not the camera having applied it. Any setting that must be in
+effect before the next command needs a read-back, and any fixed delay is a guess that is wrong for
+some magnitude of change.
+
+### "No increased range" can mean the scene had none (2026-09-29)
+
+The correctly-shot ±2 bracket recovered **0.00 stops**, which looked like a broken merge and was not.
+Measured in linear light, the metered frame's brightest pixel was **0.11** and the +2 frame's was
+0.46 — the whole scene sat in the bottom eighth of the range, three stops clear of clipping. There
+was nothing above white to recover, so the merge correctly returned the metered exposure.
+
+Worth knowing when testing: an HDR bracket only shows its value on a scene that *exceeds* one
+exposure — a window in a room, a lamp in frame, a bright sky. On a dim evenly-lit subject the honest
+result is no visible change, and the status line says so ("the scene already fitted in one
+exposure") rather than inventing a difference.
+
+`CIRAWFilter` with `boostAmount = 0` renders darker than a normal RAW conversion, because Apple's
+default tone curve is doing the lifting in the usual path. That is correct for measurement — the
+merge wants scene light, not a rendering — but it means linear values read lower than intuition
+suggests, and 0.11 is a dim scene rather than a broken decode.
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).
