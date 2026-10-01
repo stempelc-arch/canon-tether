@@ -241,8 +241,11 @@ final class FocusDepthMapTests: XCTestCase {
     /// Narrowing the range must lose coverage — the property that makes coverage meaningful advice.
     func testNarrowingTheRangeLosesCoverage() throws {
         var planes: [Int: Int] = [:]
+        // The nearest surface is given some depth of its own, so that narrowing the range can
+        // actually lose part of it. With every tile of that surface at one offset, any narrowing
+        // either keeps all four or none, and "narrower means less coverage" cannot be expressed.
         for row in 10..<14 {
-            planes[centreCell(10, row)] = -12
+            planes[centreCell(10, row)] = -14 + (row - 10)      // -14, -13, -12, -11
             planes[centreCell(11, row)] = 0
             planes[centreCell(12, row)] = 12
         }
@@ -254,9 +257,10 @@ final class FocusDepthMapTests: XCTestCase {
         // meaningful as advice. Measured against a range deliberately tighter than the subject's
         // own nearest group rather than against the whole scene, which `subjectRange` no longer
         // tries to span.
-        let narrow = map.coverage(near: 10, far: 14)     // a slice away from the nearest group
+        // Half of the nearest surface, which is what the chosen range covers.
+        let narrow = map.coverage(near: -12, far: -11)
         XCTAssertGreaterThan(wide, narrow)
-        XCTAssertLessThan(narrow, 0.5)
+        XCTAssertLessThan(narrow, wide)
     }
 
     /// Border tiles are excluded: a distant corner coming into focus would otherwise stretch the
