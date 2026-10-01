@@ -215,10 +215,13 @@ final class FocusDepthMapTests: XCTestCase {
     /// the nearest surface is what made earlier stacks miss most of the subject.
     func testRangeSpansTheSubjectsDepth() throws {
         var planes: [Int: Int] = [:]
-        for row in 4..<8 {
-            planes[centreCell(5, row)] = -10
-            planes[centreCell(6, row)] = 0
-            planes[centreCell(7, row)] = 14
+        // Columns and rows chosen well inside `border` (grid/4 = 6 cells each edge). A fixture at
+        // column 5 has its whole nearest surface discarded as border before any clustering runs,
+        // which is a property of the test's geometry rather than of the code under test.
+        for row in 10..<14 {
+            planes[centreCell(10, row)] = -10
+            planes[centreCell(11, row)] = 0
+            planes[centreCell(12, row)] = 14
         }
         // Everything else is featureless. Without this the helper gives *every* cell a peak at 0,
         // so the scene is a flat wall of 564 tiles with twelve specks on it — which is not the
@@ -238,10 +241,10 @@ final class FocusDepthMapTests: XCTestCase {
     /// Narrowing the range must lose coverage — the property that makes coverage meaningful advice.
     func testNarrowingTheRangeLosesCoverage() throws {
         var planes: [Int: Int] = [:]
-        for row in 4..<8 {
-            planes[centreCell(5, row)] = -12
-            planes[centreCell(6, row)] = 0
-            planes[centreCell(7, row)] = 12
+        for row in 10..<14 {
+            planes[centreCell(10, row)] = -12
+            planes[centreCell(11, row)] = 0
+            planes[centreCell(12, row)] = 12
         }
         let frames = scene(planes: planes, blankCells: blankingAllBut(planes), offsets: Array(-40...40))
         let map = FocusDepthMap(framesByOffset: frames)
