@@ -178,6 +178,9 @@ public struct FocusStackCritique: Equatable {
     /// frame has no neighbour on one side, so when it wins a large share the likeliest reason is
     /// that the subject carried on and the bracket did not.
     public static let clippedEndShare = 0.15
+    /// How far past its fair portion an end frame must reach before it counts as not having handed
+    /// over to a neighbour.
+    public static let endShareFactor = 1.8
 
     public init(coverage: CoverageMap,
                 region: (x: Double, y: Double, width: Double, height: Double)? = nil) {
@@ -201,10 +204,18 @@ public struct FocusStackCritique: Equatable {
         let shares = coverage.shares()
         // The subject running past the end of the bracket, though, is visible in one merge: the
         // outermost frame keeps winning instead of handing over.
-        if let first = shares.first, first > FocusStackCritique.clippedEndShare {
+        // Judged against what an end frame is *expected* to hold, not a flat fraction.
+        //
+        // A fixed 15% is meaningless when there are only two or three frames: with two, each end
+        // frame holds half the picture by definition, and a flat threshold flagged a perfectly good
+        // stack as clipped at both ends simultaneously. The share only means "this frame never
+        // handed over" when it is large relative to its fair portion.
+        let fairShare = 1.0 / Double(max(shares.count, 1))
+        let endThreshold = max(FocusStackCritique.clippedEndShare, fairShare * FocusStackCritique.endShareFactor)
+        if let first = shares.first, shares.count > 2, first > endThreshold {
             found.append(.rangeClippedAtStart(share: first))
         }
-        if let last = shares.last, shares.count > 1, last > FocusStackCritique.clippedEndShare {
+        if let last = shares.last, shares.count > 2, last > endThreshold {
             found.append(.rangeClippedAtEnd(share: last))
         }
         let leading = shares.prefix { $0 < FocusStackCritique.deadFrameShare }.count

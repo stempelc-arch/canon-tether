@@ -75,7 +75,10 @@ final class FocusRangeTests: XCTestCase {
             let plan = FocusRangePlanner.plan(for: range, overlap: .tight,
                                               settleSeconds: 0.4, returnToStart: true)
             XCTAssertNotNil(plan)
-            XCTAssertFalse(plan!.step.isNear, "a bracket always walks away from the camera")
+            // Direction is no longer fixed. The sweep leaves focus where it ended and
+            // `FocusRangePlanner.startEnd` shoots from whichever end of the marked range is nearer,
+            // which saved roughly 90 steps of travel per stack; a merge is order-agnostic because
+            // every frame is aligned to its neighbour either way.
             XCTAssertEqual(plan!.step.magnitude, range.magnitude)
             XCTAssertEqual(plan!.stepsPerFrame, 2)
             XCTAssertEqual(plan!.frameCount, 7)
@@ -139,13 +142,23 @@ final class FocusRangeTests: XCTestCase {
         XCTAssertNil(FocusScanReader.read([FocusScanSample(position: 0, score: 90)]))
     }
 
-    /// A distant highlight or a second object can push an unrelated position over the threshold;
-    /// walking outward from the peak keeps the range from stretching across a gap.
-    func testScanDoesNotStretchAcrossAGap() throws {
-        let twoPeaks: [Int: Int] = [-1: 20, 0: 95, 1: 88, 2: 30, 3: 12, 4: 15, 5: 90, 6: 20]
-        let suggestion = try XCTUnwrap(FocusScanReader.read(samples(twoPeaks)))
+    /// A real subject is several surfaces at different depths, and its sharpness curve *dips*
+    /// between them. The reader therefore takes the above-threshold run containing the peak and
+    /// tolerates gaps up to `gapTolerance` — an earlier version stopped at the first below-threshold
+    /// sample and returned a span of **zero** on a realistic subject.
+    func testScanSpansSurfacesSeparatedByADip() throws {
+        let twoSurfaces: [Int: Int] = [-1: 20, 0: 95, 1: 88, 2: 30, 3: 12, 4: 15, 5: 90, 6: 20]
+        let suggestion = try XCTUnwrap(FocusScanReader.read(samples(twoSurfaces)))
         XCTAssertEqual(suggestion.nearMark, 0)
-        XCTAssertEqual(suggestion.farMark, 1)
+        XCTAssertGreaterThanOrEqual(suggestion.farMark, 5, "the far surface belongs to the subject")
+    }
+
+    /// A gap wider than the tolerance is still a different object, not more subject.
+    func testScanDoesNotStretchAcrossAWideGap() throws {
+        let farApart: [Int: Int] = [0: 95, 1: 88, 2: 10, 3: 8, 4: 9, 5: 8, 6: 7, 7: 9,
+                                    8: 8, 9: 7, 10: 9, 11: 92, 12: 20]
+        let suggestion = try XCTUnwrap(FocusScanReader.read(samples(farApart)))
+        XCTAssertLessThan(suggestion.farMark, 11, "a distant second object is not absorbed")
     }
 }
 
@@ -204,9 +217,13 @@ final class FocusDepthMapTests: XCTestCase {
         let frames = scene(planes: planes, blankCells: [], offsets: Array(-40...40))
         let map = FocusDepthMap(framesByOffset: frames)
         let range = try XCTUnwrap(map.subjectRange())
+        // The **nearest** substantial group, not the whole scene's depth. A subject is in front of
+        // its background by definition, so when tile depths separate into groups the nearest is the
+        // subject and anything beyond shows through the gaps around its outline. An earlier version
+        // absorbed a further group when it was large enough, which turned a 29-step subject into 59
+        // by swallowing the wall behind it.
         XCTAssertLessThanOrEqual(range.near, -10, "must reach the nearest surface")
-        XCTAssertGreaterThanOrEqual(range.far, 14, "must reach the furthest surface")
-        XCTAssertGreaterThan(map.coverage(near: range.near, far: range.far), 0.85)
+        XCTAssertLessThan(range.far, 14, "and must not swallow what is behind it")
     }
 
     /// Narrowing the range must lose coverage — the property that makes coverage meaningful advice.
@@ -221,9 +238,12 @@ final class FocusDepthMapTests: XCTestCase {
         let map = FocusDepthMap(framesByOffset: frames)
         let full = try XCTUnwrap(map.subjectRange())
         let wide = map.coverage(near: full.near, far: full.far)
-        let narrow = map.coverage(near: -2, far: 2)
+        // Narrowing below the chosen range must lose coverage — the property that makes coverage
+        // meaningful as advice. Measured against a range deliberately tighter than the subject's
+        // own nearest group rather than against the whole scene, which `subjectRange` no longer
+        // tries to span.
+        let narrow = map.coverage(near: full.near + 1, far: full.near + 2)
         XCTAssertGreaterThan(wide, narrow)
-        XCTAssertLessThan(narrow, 0.5)
     }
 
     /// Border tiles are excluded: a distant corner coming into focus would otherwise stretch the
