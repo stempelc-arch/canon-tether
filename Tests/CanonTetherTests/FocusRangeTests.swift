@@ -184,6 +184,12 @@ final class FocusDepthMapTests: XCTestCase {
 
     private func centreCell(_ column: Int, _ row: Int) -> Int { row * FocusDepthMap.grid + column }
 
+    /// Every cell except the named ones, so only the subject carries a focus signal.
+    private func blankingAllBut(_ planes: [Int: Int]) -> Set<Int> {
+        let cells = FocusDepthMap.grid * FocusDepthMap.grid
+        return Set(0..<cells).subtracting(planes.keys)
+    }
+
     func testFindsEachTilesFocusOffset() {
         let planes = [centreCell(5, 5): -10, centreCell(6, 5): 0, centreCell(6, 6): 12]
         let frames = scene(planes: planes, blankCells: [], offsets: Array(-30...30))
@@ -214,7 +220,10 @@ final class FocusDepthMapTests: XCTestCase {
             planes[centreCell(6, row)] = 0
             planes[centreCell(7, row)] = 14
         }
-        let frames = scene(planes: planes, blankCells: [], offsets: Array(-40...40))
+        // Everything else is featureless. Without this the helper gives *every* cell a peak at 0,
+        // so the scene is a flat wall of 564 tiles with twelve specks on it — which is not the
+        // subject the test describes, and made these assertions pass for the wrong reason.
+        let frames = scene(planes: planes, blankCells: blankingAllBut(planes), offsets: Array(-40...40))
         let map = FocusDepthMap(framesByOffset: frames)
         let range = try XCTUnwrap(map.subjectRange())
         // The **nearest** substantial group, not the whole scene's depth. A subject is in front of
@@ -234,7 +243,7 @@ final class FocusDepthMapTests: XCTestCase {
             planes[centreCell(6, row)] = 0
             planes[centreCell(7, row)] = 12
         }
-        let frames = scene(planes: planes, blankCells: [], offsets: Array(-40...40))
+        let frames = scene(planes: planes, blankCells: blankingAllBut(planes), offsets: Array(-40...40))
         let map = FocusDepthMap(framesByOffset: frames)
         let full = try XCTUnwrap(map.subjectRange())
         let wide = map.coverage(near: full.near, far: full.far)
@@ -242,8 +251,9 @@ final class FocusDepthMapTests: XCTestCase {
         // meaningful as advice. Measured against a range deliberately tighter than the subject's
         // own nearest group rather than against the whole scene, which `subjectRange` no longer
         // tries to span.
-        let narrow = map.coverage(near: full.near + 1, far: full.near + 2)
+        let narrow = map.coverage(near: 10, far: 14)     // a slice away from the nearest group
         XCTAssertGreaterThan(wide, narrow)
+        XCTAssertLessThan(narrow, 0.5)
     }
 
     /// Border tiles are excluded: a distant corner coming into focus would otherwise stretch the

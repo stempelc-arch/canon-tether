@@ -518,24 +518,27 @@ final class FocusCoverageRegionTests: XCTestCase {
     /// The one thing a single merge *can* establish about its own range: an end frame that keeps
     /// winning instead of handing over to a neighbour means the subject ran past the bracket.
     func testRangeClippedAtEitherEndIsReported() {
-        // Ten cells, three frames. The last frame holds four of them — it never handed over.
-        let clippedEnd = CoverageMap(width: 10, height: 1, sourceCount: 3,
-                                     winner: [0, 1, 1, 1, 1, 1, 2, 2, 2, 2],
-                                     confidence: [Float](repeating: 1, count: 10))
+        // A six-frame bracket whose last frame holds a third of the picture — far past the share
+        // it would hold if it had handed over to a neighbour. Six rather than three because the
+        // test is only meaningful on a bracket long enough for "fair share" to mean something: with
+        // two or three frames an end frame legitimately holds a third or a half.
+        let clippedEnd = CoverageMap(width: 12, height: 1, sourceCount: 6,
+                                     winner: [0, 1, 2, 3, 4, 5, 5, 5, 5, 5, 5, 5],
+                                     confidence: [Float](repeating: 1, count: 12))
         XCTAssertTrue(clippedEnd.verdictsContainClippedEnd,
                       "the subject continues past where the bracket stopped")
 
-        let clippedStart = CoverageMap(width: 10, height: 1, sourceCount: 3,
-                                       winner: [0, 0, 0, 0, 1, 1, 1, 1, 1, 2],
-                                       confidence: [Float](repeating: 1, count: 10))
+        let clippedStart = CoverageMap(width: 12, height: 1, sourceCount: 6,
+                                       winner: [0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5],
+                                       confidence: [Float](repeating: 1, count: 12))
         XCTAssertTrue(FocusStackCritique(coverage: clippedStart).verdicts.contains {
             if case .rangeClippedAtStart = $0 { return true }; return false
         })
 
         // A bracket that hands over cleanly at both ends is not criticised.
-        let clean = CoverageMap(width: 10, height: 1, sourceCount: 3,
-                                winner: [0, 1, 1, 1, 1, 1, 1, 1, 2, 2],
-                                confidence: [Float](repeating: 1, count: 10))
+        let clean = CoverageMap(width: 12, height: 1, sourceCount: 6,
+                                winner: [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
+                                confidence: [Float](repeating: 1, count: 12))
         XCTAssertFalse(FocusStackCritique(coverage: clean).verdicts.contains {
             if case .rangeClippedAtStart = $0 { return true }; return false
         })
