@@ -14,13 +14,47 @@ import Foundation
 /// linear, and as the RAW pipeline normally renders it — and builds the transfer between them. The
 /// merged result then looks like an ordinary conversion of the metered exposure, which is exactly
 /// the promise: the photograph you shot, with the highlights it could not hold.
+/// The three judgement calls in an HDR render, gathered so they can be dialled rather than guessed.
+///
+/// These are aesthetics, not correctness. Several rounds were spent tuning them from screenshots and
+/// they interact — more lift makes a wall brighter *and* more saturated, which reads as needing less
+/// contrast — so they belong in front of the photographer, who can judge a real frame in seconds.
+public struct HDRLook: Equatable, Sendable {
+    /// Most the merged scene may be brightened toward middle grey, in stops. The dominant control:
+    /// a dim room lifted three stops is a bright room, whatever the curve does afterwards.
+    public var exposureLimit: Float
+    /// How much S-curve to put back after range compression flattens the picture.
+    public var contrast: Float
+    /// How much colour survives the tone mapping. Below 1 pulls toward neutral.
+    public var saturation: Float
+
+    public static let `default` = HDRLook(exposureLimit: 3, contrast: 0.45, saturation: 0.7)
+
+    public init(exposureLimit: Float, contrast: Float, saturation: Float) {
+        self.exposureLimit = exposureLimit
+        self.contrast = contrast
+        self.saturation = saturation
+    }
+}
+
 public struct HDRToneCurve: Sendable {
+
+    /// The dialled-in look. Set by the renderer before use.
+    public var look: HDRLook = .default
+
 
     /// Fraction of a channel's maximum below which the learned curve is still considered to be
     /// carrying information rather than merely clipping.
     /// Fraction of the camera's rendered maximum below which its curve is reproduced exactly.
     /// Covers the midtones and shadows — the bulk of any photograph.
     public static let holdBelow: Float = 0.6
+    /// How strongly colour ratios survive the tone mapping, 0…1.
+    ///
+    /// 1 preserves them exactly and over-saturates badly once the merge has been exposed up by
+    /// several stops; 0 renders a greyscale image. 0.7 is the usual range for a global HDR operator
+    /// and keeps a warm wall warm without making it fluoresce.
+    public static let saturation: Float = 0.7
+
     /// How much of the S-curve to blend in, 0…1.
     ///
     /// 0.45 lands near the "+60 contrast" the photographer was reaching for by hand on a merge that
@@ -28,10 +62,17 @@ public struct HDRToneCurve: Sendable {
     public static let contrastStrength: Float = 0.45
 
     /// A smoothstep S about mid-grey, blended by `contrastStrength`.
-    public static func contrast(_ value: Float) -> Float {
+    public func contrast(_ value: Float) -> Float {
         let v = Swift.min(Swift.max(value, 0), 1)
         let s = v * v * (3 - 2 * v)              // 0 at 0, 1 at 1, steeper through the middle
-        return v + (s - v) * contrastStrength
+        return v + (s - v) * look.contrast
+    }
+
+    /// The default-look version, for tests and callers that have no opinion.
+    public static func contrast(_ value: Float) -> Float {
+        var curve = HDRToneCurve(linear: [], rendered: [], channels: 3)
+        curve.look = .default
+        return curve.contrast(value)
     }
 
     /// How far up the range the shadow lift reaches. Above this, nothing is touched.
@@ -72,27 +113,41 @@ public struct HDRToneCurve: Sendable {
     /// - Parameters:
     ///   - linear: scene-linear values, interleaved.
     ///   - rendered: the same pixels as the RAW pipeline normally renders them, display-referred.
+    /// Builds the transfer on **luminance**, from paired samples of the same pixels.
+    ///
+    /// One curve, not three. A per-channel table has to be sampled at whatever exposure the merge
+    /// ends up at, and that is routinely three stops from where it was fitted — at which point the
+    /// three curves have diverged and the picture's colour is being decided by extrapolation. On a
+    /// real bracket that turned a warm wall into a garish orange and washed the window.
+    ///
+    /// Colour is not lost by doing this: `CIRAWFilter` has already applied white balance and the
+    /// camera's colour matrix to the linear data, so the channel *ratios* are right already. This
+    /// curve decides how bright each pixel is, and the ratios carry the colour across unchanged.
     public init(linear: [Float], rendered: [Float], channels: Int, sceneWhite: Float = 1) {
         self.sceneWhite = sceneWhite
         let n = min(linear.count, rendered.count)
-        var sums = [[Double]](repeating: [Double](repeating: 0, count: Self.resolution), count: channels)
-        var counts = [[Int]](repeating: [Int](repeating: 0, count: Self.resolution), count: channels)
+        let curves = 1
+        var sums = [[Double]](repeating: [Double](repeating: 0, count: Self.resolution), count: curves)
+        var counts = [[Int]](repeating: [Int](repeating: 0, count: Self.resolution), count: curves)
 
         var index = 0
         while index + channels <= n {
-            for channel in 0..<channels {
-                let l = linear[index + channel]
-                guard l.isFinite, l >= 0 else { continue }
+            func luma(_ source: [Float]) -> Float {
+                guard channels >= 3 else { return source[index] }
+                return 0.2126 * source[index] + 0.7152 * source[index + 1] + 0.0722 * source[index + 2]
+            }
+            let l = luma(linear)
+            if l.isFinite, l >= 0 {
                 let bin = Swift.min(Self.resolution - 1, Int(Swift.min(l, 1) * Float(Self.resolution - 1)))
-                sums[channel][bin] += Double(rendered[index + channel])
-                counts[channel][bin] += 1
+                sums[0][bin] += Double(luma(rendered))
+                counts[0][bin] += 1
             }
             index += channels
         }
 
         table = []
         whitePoint = []
-        for channel in 0..<channels {
+        for channel in 0..<curves {
             var curve = [Float](repeating: 0, count: Self.resolution)
             // Fill measured bins, then carry the last known value across empty ones — a scene need
             // not contain every brightness, and a gap must not become a step in the curve.
@@ -222,24 +277,39 @@ public struct HDRToneCurve: Sendable {
         guard channels >= 3 else {
             for i in 0..<out.data.count {
                 let rendered = apply(radiance.data[i], channel: i % channels)
-                out.data[i] = Swift.min(Swift.max(Self.lift(Self.contrast(rendered)), 0), 1)
+                out.data[i] = Swift.min(Swift.max(Self.lift(contrast(rendered)), 0), 1)
             }
             return out
         }
         for pixel in stride(from: 0, to: out.data.count - channels + 1, by: channels) {
-            let r = apply(radiance.data[pixel], channel: 0)
-            let g = apply(radiance.data[pixel + 1], channel: 1)
-            let b = apply(radiance.data[pixel + 2], channel: 2)
-            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
-            guard luma > 0.0001 else {
-                out.data[pixel] = r; out.data[pixel + 1] = g; out.data[pixel + 2] = b
+            let r = radiance.data[pixel], g = radiance.data[pixel + 1], b = radiance.data[pixel + 2]
+            let sceneLuma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            guard sceneLuma > 0.000001 else {
+                for c in 0..<channels { out.data[pixel + c] = 0 }
                 continue
             }
-            let shaped = Self.lift(Self.contrast(luma))
-            let gain = shaped / luma
-            out.data[pixel]     = Swift.min(Swift.max(r * gain, 0), 1)
-            out.data[pixel + 1] = Swift.min(Swift.max(g * gain, 0), 1)
-            out.data[pixel + 2] = Swift.min(Swift.max(b * gain, 0), 1)
+            // One curve, on luminance — and the ratios are carried across with an exponent, not
+            // intact.
+            //
+            // **Preserving ratios exactly is what over-saturates.** Scale a dark saturated orange up
+            // by three stops and its red pins at 1 while its blue is still low, so the ratio becomes
+            // extreme: measured on a real bracket, a warm wall came out a screaming orange and a
+            // blue sky electric cyan. A camera's own per-channel curve hides this by compressing
+            // each channel separately, which desaturates bright colours as a side effect — the
+            // thing that is lost by moving to a single luminance curve, and that has to be put back
+            // deliberately.
+            //
+            // `pow(ratio, saturation)` with saturation below 1 pulls colours toward neutral in
+            // proportion to how far they sit from it, which is the standard answer and is also what
+            // film does as it approaches its shoulder.
+            let shaped = Self.lift(contrast(apply(sceneLuma, channel: 0)))
+            @inline(__always) func channel(_ value: Float) -> Float {
+                let ratio = Swift.max(value, 0) / sceneLuma
+                return Swift.min(Swift.max(shaped * powf(ratio, look.saturation), 0), 1)
+            }
+            out.data[pixel]     = channel(r)
+            out.data[pixel + 1] = channel(g)
+            out.data[pixel + 2] = channel(b)
             for extra in 3..<channels { out.data[pixel + extra] = radiance.data[pixel + extra] }
         }
         return out

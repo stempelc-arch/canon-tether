@@ -49,6 +49,7 @@ enum HDRRenderer {
     static func render(urls: [URL],
                        referenceIndex: Int,
                        outputURL: URL,
+                       look: HDRLook = HDRSettings.load(),
                        progress: @escaping (Double, String) -> Void = { _, _ in }) throws -> Render {
         guard urls.count >= 2 else { throw RenderError.needsTwoFrames }
 
@@ -86,6 +87,7 @@ enum HDRRenderer {
         // actually added something.
         var toneCurve = try learnedToneCurve(from: urls[min(max(referenceIndex, 0), urls.count - 1)],
                                              context: context, linearSpace: linearSpace)
+        toneCurve.look = look
         // How bright the scene actually gets, measured on a small merge before committing to the
         // full one. The compression is anchored to this so the brightest recovered detail lands at
         // white; guessing it from the darkest frame's exposure instead would anchor to the range
@@ -96,7 +98,7 @@ enum HDRRenderer {
                                       context: context, linearSpace: linearSpace)
         // Expose the merged scene, rather than inheriting the metered frame's exposure.
         var keyGain = targetKey / measured.key
-        let limit = powf(2, keyAdjustmentLimit)
+        let limit = powf(2, look.exposureLimit)
         keyGain = Swift.min(Swift.max(keyGain, 1 / limit), limit)
         toneCurve.sceneWhite = measured.white * keyGain
         FileHandle.appendLog(String(format:
