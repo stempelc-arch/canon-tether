@@ -141,43 +141,14 @@ public struct HDRToneCurve: Sendable {
                     curve[bin] = start + (1 - start) * powf(t, Self.highlightGamma)
                 }
             }
-            // **Contrast.** Put back what the range compression takes out.
+            // Contrast and the shadow lift are **not** baked in here.
             //
-            // Fitting eight or ten stops into a display is a flattening operation by definition:
-            // Reinhard squashes the upper midtones and the shadow lift raises the bottom, and
-            // neither restores the slope through the middle. The photographer's own verdict on the
-            // first version that got the range right was that it needed "+60 contrast in
-            // Lightroom" — which is the app asking someone else to finish its job.
-            //
-            // A smoothstep S blended by `contrastStrength`: monotonic, smooth everywhere, and it
-            // pins 0 and 1 so neither black nor white moves. Global, like everything else here, so
-            // it cannot halo.
-            //
-            // Applied *before* the shadow lift, so the lift has the last word and the shadows stay
-            // open — an S-curve applied afterwards re-darkens the bottom end and undoes it.
-            for bin in 0..<Self.resolution {
-                curve[bin] = Self.contrast(curve[bin])
-            }
-
-            // A modest, global lift of the shadows.
-            //
-            // Symmetric with what happens at the top. Recovered highlights were given display range
-            // by folding the camera's clipped white down; the bottom end needs the same courtesy, or
-            // the extra exposures spent on the shadows buy noise reduction the photographer cannot
-            // see. The merge makes shadows *cleaner*; without this it does not make them *visible*.
-            //
-            // Global, and therefore not the cliché. The tone-mapped look comes from *local*
-            // operators deciding a pixel from its neighbourhood, which is what produces haloes; one
-            // curve applied to every pixel alike cannot halo — it is what any raw converter's
-            // Shadows slider does.
-            //
-            // **Black stays black.** The lift is a gamma applied under `shadowRange` and faded out
-            // by how far above black a value already is, so it approaches zero at zero. Adding a
-            // constant instead would raise the black point and give the milky, washed-out look that
-            // is the other half of what people mean by "HDR-looking".
-            for bin in 0..<Self.resolution {
-                curve[bin] = Self.lift(curve[bin])
-            }
+            // This table is per channel, because it is reproducing the camera's own rendering
+            // including its white balance. Applying a *tonal* curve per channel as well stretches
+            // the gaps between R, G and B — which is a saturation and hue shift, not a brightness
+            // change. Shipped that way it turned a warm wall into a garish orange and read as
+            // exactly the over-processed look this feature exists to avoid. Tonality is applied to
+            // luminance in `render`, with the colour ratios carried across unchanged.
 
             table.append(curve)
             whitePoint.append(curve[Self.resolution - 1])
@@ -240,11 +211,36 @@ public struct HDRToneCurve: Sendable {
     }
 
     /// Renders a whole merged image.
+    ///
+    /// Two stages, deliberately separated. The learned curve runs **per channel**, because it is
+    /// reproducing a rendering that includes white balance. Contrast and the shadow lift then run on
+    /// **luminance only**, and every channel is scaled by the same factor — so the picture's
+    /// tonality changes while its colour does not.
     public func render(_ radiance: StackImage) -> StackImage {
         var out = radiance
         let channels = radiance.channels
-        for i in 0..<out.data.count {
-            out.data[i] = Swift.min(Swift.max(apply(radiance.data[i], channel: i % channels), 0), 1)
+        guard channels >= 3 else {
+            for i in 0..<out.data.count {
+                let rendered = apply(radiance.data[i], channel: i % channels)
+                out.data[i] = Swift.min(Swift.max(Self.lift(Self.contrast(rendered)), 0), 1)
+            }
+            return out
+        }
+        for pixel in stride(from: 0, to: out.data.count - channels + 1, by: channels) {
+            let r = apply(radiance.data[pixel], channel: 0)
+            let g = apply(radiance.data[pixel + 1], channel: 1)
+            let b = apply(radiance.data[pixel + 2], channel: 2)
+            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            guard luma > 0.0001 else {
+                out.data[pixel] = r; out.data[pixel + 1] = g; out.data[pixel + 2] = b
+                continue
+            }
+            let shaped = Self.lift(Self.contrast(luma))
+            let gain = shaped / luma
+            out.data[pixel]     = Swift.min(Swift.max(r * gain, 0), 1)
+            out.data[pixel + 1] = Swift.min(Swift.max(g * gain, 0), 1)
+            out.data[pixel + 2] = Swift.min(Swift.max(b * gain, 0), 1)
+            for extra in 3..<channels { out.data[pixel + extra] = radiance.data[pixel + extra] }
         }
         return out
     }
