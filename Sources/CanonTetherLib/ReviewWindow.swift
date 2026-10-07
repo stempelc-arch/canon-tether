@@ -30,15 +30,9 @@ enum PreviewLoader {
         if let cached = cache.object(forKey: keyString as NSString) { return cached }
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
-                    continuation.resume(returning: nil); return
-                }
-                let options: [CFString: Any] = [
-                    kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
-                    kCGImageSourceThumbnailMaxPixelSize: maxPixel,
-                    kCGImageSourceCreateThumbnailWithTransform: true
-                ]
-                guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+                // Via `ImageThumbnail`, not ImageIO directly: a JPEG's 160×120 EXIF thumbnail
+                // would otherwise be served for any requested size. See that type's comment.
+                guard let cg = ImageThumbnail.load(url, maxPixel: maxPixel) else {
                     continuation.resume(returning: nil); return
                 }
                 let image = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))

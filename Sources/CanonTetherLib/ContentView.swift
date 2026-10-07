@@ -11,7 +11,9 @@ public struct ContentView: View {
     @StateObject private var reviewWindow = ReviewWindowController()
     @StateObject private var sleepPreventer = SleepPreventer()
     @StateObject private var updateChecker = UpdateChecker()
+    @StateObject private var focusStackWindow = FocusStackWindowController()
     @State private var showingPreferences = false
+    @State private var showingTimelapse = false
     /// When on, the filmstrip hides shots with Soft/Borderline focus or Over/Under exposure, showing
     /// only the good ones — a fast triage pass so the photographer's picks come from shots worth
     /// looking at.
@@ -61,6 +63,9 @@ public struct ContentView: View {
             reviewModel.sync(with: newCaptures)
         }
         .toolbar { presenterToolbar }
+        .sheet(isPresented: $showingTimelapse) {
+            TimelapseSheet(viewModel: viewModel)
+        }
         .sheet(isPresented: $showingPreferences) {
             PreferencesView(viewModel: viewModel, reviewModel: reviewModel, analysis: analysis,
                             updateChecker: updateChecker,
@@ -69,51 +74,38 @@ public struct ContentView: View {
         .task { await updateChecker.checkInBackground() }
     }
 
+    /// Divides the toolbar's groups.
+    ///
+    /// A plain `Divider()` renders in a toolbar as a very short, very faint dash — close to
+    /// invisible against a dark toolbar, which defeats the point of grouping the controls at all.
+    /// This is drawn explicitly: the height of the icon row, and a weight that reads as a
+    /// deliberate boundary rather than an artefact.
+    ///
+    /// Pure SwiftUI shapes, deliberately — an AppKit-backed control pinned below its intrinsic
+    /// size is the `SIGILL` trap documented in CLAUDE.md, and a separator is exactly the sort of
+    /// thing one is tempted to force to a small fixed height.
+    private var toolbarSeparator: some View {
+        RoundedRectangle(cornerRadius: 1)
+            .fill(Color.primary.opacity(0.28))
+            .frame(width: 2, height: 22)
+            .padding(.horizontal, 7)
+            .accessibilityHidden(true)
+    }
+
     @ToolbarContentBuilder
     private var presenterToolbar: some ToolbarContent {
-        ToolbarItem(placement: .principal) {
-            Picker("Client shows", selection: $reviewModel.mode) {
-                ForEach(ReviewMode.allCases) { mode in
-                    Label(mode.label, systemImage: mode.symbol).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .help("Choose what the client monitor displays")
-        }
+        // Grouped by what the control *acts on*, left to right: the camera, then the client
+        // monitor in the centre, then this session's shots, then the app itself. Before, the nine
+        // items sat in one undifferentiated row with related ones far apart — the client-monitor
+        // mode picker was at the far left while the button that opens the client screen was five
+        // icons away, next to Focus Stack.
+        //
+        // Everything stays in `.primaryAction` and `.principal`. Those are the two placements that
+        // do not collapse into the overflow chevron, and a shooting control you have to go hunting
+        // for is useless — which is how Live View came to be hidden once already.
 
-        ToolbarItem {
-            Menu {
-                Picker("Interval", selection: $reviewModel.slideshowInterval) {
-                    Text("2 seconds").tag(2.0)
-                    Text("3 seconds").tag(3.0)
-                    Text("4 seconds").tag(4.0)
-                    Text("6 seconds").tag(6.0)
-                    Text("10 seconds").tag(10.0)
-                }
-            } label: {
-                Label("Slideshow speed", systemImage: "timer")
-            }
-            .help("Slideshow interval")
-        }
-
-        ToolbarItem {
-            Button {
-                showingOnlyGood.toggle()
-                if showingOnlyGood {
-                    Task { await analysis.analyzeAll(viewModel.captures) }
-                }
-            } label: {
-                Label("Show Good Shots Only", systemImage: showingOnlyGood ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
-                    .foregroundStyle(showingOnlyGood ? Color.green : Color.primary)
-            }
-            .help(showingOnlyGood
-                  ? "Hiding soft-focus or bad-exposure shots — click to show everything"
-                  : "Filter the filmstrip to sharp, well-exposed shots, to flag picks faster")
-        }
-
-        // .primaryAction so it can't end up collapsed into the toolbar's overflow chevron — this
-        // is a shooting control, and a composing aid you have to go hunting for is useless.
-        ToolbarItem(placement: .primaryAction) {
+        // MARK: The camera
+        ToolbarItemGroup(placement: .primaryAction) {
             Button {
                 viewModel.toggleLiveView()
             } label: {
@@ -128,9 +120,50 @@ public struct ContentView: View {
             // routinely, and gating both directions left the canvas stuck on a frozen frame with
             // the only way back to reviewing shots greyed out.
             .disabled(!viewModel.isConnected && !viewModel.isLiveViewOn)
+
+            Button {
+                focusStackWindow.toggle(viewModel: viewModel)
+            } label: {
+                Label("Focus Stack", systemImage: "camera.metering.center.weighted")
+            }
+            .help("Shoot a focus bracket and merge it into one all-in-focus image")
+            .disabled(!viewModel.isConnected)
+
+            // A menu rather than a plain button: the spread is the one thing that changes between
+            // scenes, and burying it in Preferences would mean leaving the shot to go and set it.
+            Button {
+                viewModel.captureHDR()
+            } label: {
+                Label("HDR", systemImage: "camera.filters")
+            }
+            .help("Shoot an exposure bracket in RAW and blend it. Keeps shooting until nothing is "
+                  + "clipped or buried in noise, then takes each part of the picture from whichever "
+                  + "exposure rendered it well.")
+            .disabled(!viewModel.isConnected || viewModel.isBusy)
+
+            Button {
+                showingTimelapse = true
+            } label: {
+                Label("Timelapse", systemImage: "timelapse")
+            }
+            .help("Shoot a timelapse, holding the exposure as the light changes")
+            .disabled(!viewModel.isConnected || viewModel.isBusy)
+
+            toolbarSeparator
         }
 
-        ToolbarItem(placement: .primaryAction) {
+        // MARK: What the client sees
+        ToolbarItem(placement: .principal) {
+            Picker("Client shows", selection: $reviewModel.mode) {
+                ForEach(ReviewMode.allCases) { mode in
+                    Label(mode.label, systemImage: mode.symbol).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .help("Choose what the client monitor displays")
+        }
+
+        ToolbarItemGroup(placement: .primaryAction) {
             Button {
                 reviewWindow.toggle(viewModel: viewModel, reviewModel: reviewModel)
             } label: {
@@ -141,18 +174,66 @@ public struct ContentView: View {
                   ? "Client screen is on — click to turn it off (⌘R)"
                   : "Show the client screen, full-screen on the other monitor (⌘R)")
             .keyboardShortcut("r", modifiers: .command)
+
+            // Only while the client monitor is actually running a slideshow. A speed control for
+            // something that is not playing is a permanent slot spent on nothing.
+            if reviewModel.mode == .slideshow {
+                Menu {
+                    Picker("Interval", selection: $reviewModel.slideshowInterval) {
+                        Text("2 seconds").tag(2.0)
+                        Text("3 seconds").tag(3.0)
+                        Text("4 seconds").tag(4.0)
+                        Text("6 seconds").tag(6.0)
+                        Text("10 seconds").tag(10.0)
+                    }
+                } label: {
+                    Label("Slideshow speed", systemImage: "timer")
+                }
+                .help("How long each shot stays on the client screen")
+            }
+
+            toolbarSeparator
         }
 
-        ToolbarItem {
+        // MARK: This session's shots
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button {
+                showingOnlyGood.toggle()
+                if showingOnlyGood {
+                    Task { await analysis.analyzeAll(viewModel.captures) }
+                }
+            } label: {
+                Label("Show Good Shots Only",
+                      systemImage: showingOnlyGood ? "line.3.horizontal.decrease.circle.fill"
+                                                   : "line.3.horizontal.decrease.circle")
+                    .foregroundStyle(showingOnlyGood ? Color.green : Color.primary)
+            }
+            .help(showingOnlyGood
+                  ? "Hiding soft-focus or bad-exposure shots — click to show everything"
+                  : "Filter the filmstrip to sharp, well-exposed shots, to flag picks faster")
+
+            Button {
+                viewModel.exportPicks(reviewModel.flaggedOrdered(in: viewModel.captures))
+            } label: {
+                Label("Export Flagged", systemImage: "square.and.arrow.up")
+            }
+            .help("Copy the flagged picks to a folder")
+            // Just the emptiness check — building the full ordered list (filter + reverse over
+            // every capture) twice per render was measurable steady-state work on big sessions.
+            .disabled(reviewModel.flagged.isEmpty)
+
+            toolbarSeparator
+        }
+
+        // MARK: The app
+        ToolbarItemGroup(placement: .primaryAction) {
             CoffeeButton(isOn: sleepPreventer.isPreventingSleep) {
                 sleepPreventer.toggle()
             }
             .help(sleepPreventer.isPreventingSleep
                   ? "Preventing sleep — click to allow the Mac to sleep again"
                   : "Keep the Mac awake during the session")
-        }
 
-        ToolbarItem {
             Button {
                 showingPreferences = true
             } label: {
@@ -173,24 +254,16 @@ public struct ContentView: View {
                   ?? "Preferences (⌘,)")
             .keyboardShortcut(",", modifiers: .command)
         }
-
-        ToolbarItem {
-            Button {
-                viewModel.exportPicks(reviewModel.flaggedOrdered(in: viewModel.captures))
-            } label: {
-                Label("Export Flagged", systemImage: "square.and.arrow.up")
-            }
-            .help("Copy the flagged picks to a folder")
-            // Just the emptiness check — building the full ordered list (filter + reverse over
-            // every capture) twice per render was measurable steady-state work on big sessions.
-            .disabled(reviewModel.flagged.isEmpty)
-        }
     }
 
     // MARK: - Capture column (preview + control bar)
 
     private var captureColumn: some View {
-        let url = reviewModel.mainViewerURL(in: viewModel.captures)
+        // A running timelapse owns the viewer. Its frames never reach the gallery — a 300-frame
+        // sequence is one piece of work, not 300 photographs — so without this the photographer
+        // watches a stale picture for an hour with no idea whether the light has changed or someone
+        // has walked into the shot.
+        let url = viewModel.timelapsePreview ?? reviewModel.mainViewerURL(in: viewModel.captures)
         return VStack(spacing: 0) {
             if !viewModel.isConnected {
                 ReconnectBanner(status: viewModel.statusText)
@@ -200,6 +273,10 @@ public struct ContentView: View {
                           feed: viewModel.liveViewFeed,
                           isLiveViewOn: viewModel.isLiveViewOn)
                 .overlay(alignment: .top) { mainViewerControl }
+
+            if let operation = viewModel.operation {
+                OperationBar(operation: operation) { viewModel.cancelOperation() }
+            }
 
             Divider()
 
@@ -1076,6 +1153,125 @@ private struct OnboardingView: View {
 
 // MARK: - Preferences
 
+/// Progress for a long job: what it is doing, how far through, and roughly how much longer.
+///
+/// The "how much longer" matters more than it looks. A focus-stack merge or a 300-frame timelapse is
+/// minutes of apparently nothing happening, and without a number the photographer cannot tell a slow
+/// step from a hung one — which is a question that came up repeatedly while building these features,
+/// usually answered by reading a log.
+private struct OperationBar: View {
+    let operation: CameraViewModel.Operation
+    let cancel: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            // Determinate where the length is known, indeterminate where it genuinely is not —
+            // an automatic bracket cannot know how many exposures it needs until it has measured.
+            if let fraction = operation.fraction {
+                ProgressView(value: min(max(fraction, 0), 1))
+                    .frame(width: 160)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+            Text(operation.label)
+                .font(.callout)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if let remaining = operation.remaining, remaining > 2 {
+                Text(Self.readable(remaining))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if operation.isCancellable {
+                Button("Stop", action: cancel)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(.quaternary.opacity(0.4))
+    }
+
+    /// Rounded, never false-precise: "about 4 min" is honest where "4:07 remaining" is not, given
+    /// the estimate comes from an average that is still moving.
+    static func readable(_ seconds: TimeInterval) -> String {
+        if seconds < 90 { return "about \(Int((seconds / 5).rounded()) * 5)s left" }
+        return "about \(Int((seconds / 60).rounded())) min left"
+    }
+}
+
+private struct TimelapseSheet: View {
+    @ObservedObject var viewModel: CameraViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Timelapse").font(.title2.weight(.semibold))
+
+            // Plain rows rather than `Grid`: the deployment target is older than macOS 13.
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("Interval").frame(width: 92, alignment: .leading)
+                    Stepper(value: $viewModel.timelapseInterval, in: 2...120, step: 1) {
+                        Text("\(Int(viewModel.timelapseInterval)) seconds").monospacedDigit()
+                    }
+                }
+                HStack {
+                    Text("Frames").frame(width: 92, alignment: .leading)
+                    Stepper(value: $viewModel.timelapseFrames, in: 10...5000, step: 10) {
+                        Text("\(viewModel.timelapseFrames)").monospacedDigit()
+                    }
+                }
+                HStack {
+                    Text("ISO ceiling").frame(width: 92, alignment: .leading)
+                    Picker("", selection: $viewModel.timelapseHighestISO) {
+                        ForEach([800.0, 1600, 3200, 6400, 12800], id: \.self) { iso in
+                            Text("ISO \(Int(iso))").tag(iso)
+                        }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                }
+            }
+
+            Text(runtimeSummary)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            Text("Exposure is held as the light changes, moving in the camera's own 1/3-stop "
+                 + "clicks — shutter first, then ISO once the shutter reaches the interval. Every "
+                 + "frame is then developed with the correction that makes those steps invisible, "
+                 + "into a Developed folder beside the RAWs.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Start") {
+                    viewModel.captureTimelapse()
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 460)
+    }
+
+    private var runtimeSummary: String {
+        let seconds = viewModel.timelapseInterval * Double(viewModel.timelapseFrames)
+        let hours = Int(seconds) / 3600, minutes = (Int(seconds) % 3600) / 60
+        let shooting = hours > 0 ? "\(hours)h \(minutes)m" : "\(minutes)m"
+        // 24 fps is the usual delivery rate; saying it in seconds of footage is what the
+        // photographer is actually deciding.
+        let footage = Double(viewModel.timelapseFrames) / 24
+        return String(format: "%@ of shooting — about %.0f seconds of footage at 24 fps",
+                      shooting, footage)
+    }
+}
+
 private struct PreferencesView: View {
     @ObservedObject var viewModel: CameraViewModel
     @ObservedObject var reviewModel: ReviewModel
@@ -1088,6 +1284,7 @@ private struct PreferencesView: View {
     @AppStorage("focusCheckEnabled") private var focusEnabled = true
     @AppStorage("exposureCheckEnabled") private var exposureEnabled = true
     @AppStorage("checkForUpdates") private var updatesEnabled = true
+    @State private var backups: [CaptureBackup.Destination] = BackupSettings.load()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -1111,6 +1308,44 @@ private struct PreferencesView: View {
                     .font(.caption)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // Grouped so the VStack stays within SwiftUI's ten-child builder limit.
+            Group {
+                Divider()
+
+                Divider()
+
+                // Backup drives
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Backup Drives").font(.headline)
+                    ForEach(backups) { destination in
+                        HStack(spacing: 8) {
+                            // Connected or not, checked as the list is drawn: an external that has been
+                            // unplugged is the normal case, not an error, and the photographer needs to
+                            // see it here rather than discover it from a warning mid-shoot.
+                            Image(systemName: isConnected(destination) ? "externaldrive.fill.badge.checkmark"
+                                                                       : "externaldrive.badge.xmark")
+                                .foregroundStyle(isConnected(destination) ? Color.green : Color.orange)
+                                .help(isConnected(destination) ? "Connected" : "Not connected — copies to this drive are skipped")
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(destination.label).font(.callout)
+                                Text(destination.root.path)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            Button("Remove") { remove(destination) }
+                        }
+                    }
+                    Button("Add Drive…") { addBackup() }
+                    Text(backupExplanation)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             Divider()
@@ -1200,6 +1435,45 @@ private struct PreferencesView: View {
         }
         if updateChecker.lastCheckFailed { return "Couldn't reach the update server." }
         return "You're on version \(UpdateChecker.currentVersion), the latest."
+    }
+
+    private func isConnected(_ destination: CaptureBackup.Destination) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: destination.root.path, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+    }
+
+    private var backupExplanation: String {
+        switch backups.count {
+        case 0:
+            return "Every shot is written here as it lands, as well as to the capture folder. With none set, the only copy of a shoot is on this Mac. Standard practice is two separate external drives."
+        case 1:
+            return "Shots are copied here as they land. One more external drive would match standard practice — two backups plus the working copy on this Mac."
+        default:
+            return "Shots are written to all of these as they land, at the same time as the capture folder. A drive that isn't connected is skipped and reported; plug it back in and the next shots resume copying to it."
+        }
+    }
+
+    private func addBackup() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Use for Backup"
+        panel.message = "Choose a folder on a backup drive"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let resolved = url.resolvingSymlinksInPath()
+        // Backing up into the capture folder is not a backup — it is the same disk and, if nested,
+        // the same folder tree the app is writing into.
+        guard resolved != CaptureLocation.directory else { return }
+        guard !backups.contains(where: { $0.root == resolved }) else { return }
+        backups.append(CaptureBackup.Destination(root: resolved, label: BackupSettings.label(for: resolved)))
+        BackupSettings.save(backups)
+    }
+
+    private func remove(_ destination: CaptureBackup.Destination) {
+        backups.removeAll { $0.id == destination.id }
+        BackupSettings.save(backups)
     }
 
     private func chooseFolder() {

@@ -29,7 +29,27 @@ final class CameraViewModel: ObservableObject {
     /// silently sitting on "waiting for camera".
     let gphotoInstalled = GPhotoSession.isInstalled
 
-    private let session = GPhotoSession()
+    // Internal rather than private: `FocusStackModel` drives brackets over the same session, so
+    // a bracket shares the one shell (and one command lock) with everything else. A second session
+    // would mean a second gphoto2 claiming the camera — which on this body can cost a re-pair.
+    let session = GPhotoSession()
+
+    /// Focus stacking runs on its own observable object (see `FocusStackModel`) but is owned here,
+    /// so it shares this view model's session and outlives the sheet that presents it — a bracket
+    /// keeps shooting if the photographer closes and reopens the panel.
+    private(set) lazy var focusStack: FocusStackModel = {
+        let model = FocusStackModel(session: session, liveView: liveViewFeed)
+        model.onStackMerged = { [weak self] url in self?.registerMergedStack(url) }
+        // Ranging drives focus, which is a live-view operation, and the photographer has to see
+        // what they're marking — so it routes through the same toggle the toolbar uses rather than
+        // starting live view behind the view model's back and desyncing the button.
+        // Set, never toggle. The session stops live view itself around a bracket, so this object's
+        // `isLiveViewOn` can be stale at exactly the moment the restart matters — and a toggle that
+        // believes it is already on does nothing, leaving the panel dark and focus drive dead.
+        model.onSetLiveView = { [weak self] on in self?.setLiveView(on) }
+        model.onRestartLiveView = { [weak self] in self?.restartLiveView() }
+        return model
+    }()
 
     /// Drives the status indicator dot: red on error, green when the camera is live, amber while
     /// still working toward a connection.
@@ -101,6 +121,14 @@ final class CameraViewModel: ObservableObject {
                     else { return nil }
                     return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
                 }.value
+                // Frames are dropped once live view is off, and must **not** switch it back on.
+                //
+                // An earlier version treated an arriving frame as proof the feed was live and
+                // raised the flag. That is wrong at the one moment it matters: decoding is
+                // asynchronous, so a frame already in flight lands *after* a stop and resurrects
+                // the flag — leaving the app showing LIVE over a stale frame with nothing running.
+                // The genuine desync this was guarding against is fixed at its source, in
+                // `restartLiveView`, by raising the flag only once the restart has completed.
                 guard self.isLiveViewOn else { continue }
                 self.liveViewFeed.update(image)
             }
@@ -182,6 +210,26 @@ final class CameraViewModel: ObservableObject {
         statusText = "Captured \(url.lastPathComponent)"
     }
 
+    /// Puts a freshly merged focus stack into the gallery. The bracket's own frames never appear —
+    /// only this one file does, which is what makes a focus stack read as a single capture.
+    private func registerMergedStack(_ url: URL) {
+        // Same project check as `handleNewCapture`, one level deeper: the merged image lives inside
+        // the bracket's subfolder, so it is the *folder* that must belong to the current project.
+        let folder = url.deletingLastPathComponent()
+        guard folder.deletingLastPathComponent() == CaptureLocation.directory else { return }
+        if let existing = captures.firstIndex(of: url) {
+            // A re-merge writes the same path. Remove and re-append so SwiftUI sees a change and
+            // views holding a cached thumbnail of the previous render reload it.
+            captures.remove(at: existing)
+            captures.append(url)
+        } else {
+            captures.append(url)
+            captureCount += 1
+        }
+        lastCaptureURL = url
+        statusText = "Merged focus stack \(url.lastPathComponent)"
+    }
+
     // MARK: - Gallery actions
 
     func revealInFinder(_ url: URL) {
@@ -250,14 +298,25 @@ final class CameraViewModel: ObservableObject {
         let dir = CaptureLocation.directory
         guard let urls = try? FileManager.default.contentsOfDirectory(
             at: dir,
-            includingPropertiesForKeys: [.contentModificationDateKey],
+            includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else { return }
 
-        let images = urls.filter {
+        var images = urls.filter {
             CaptureLocation.imageExtensions.contains($0.pathExtension.lowercased())
                 // A live-view frame stranded by a crash is not a shot; never list it as one.
                 && !$0.lastPathComponent.hasPrefix(GPhotoSession.previewFilenamePrefix)
+        }
+        // Focus-stack folders contribute exactly one entry each: the merged image. The listing
+        // above is non-recursive, so the bracket's source frames are already excluded by living a
+        // level down — this reaches in for the one file that *is* a photograph. A folder with no
+        // merged image yet (interrupted bracket) contributes nothing, which is correct.
+        // "Focus Scan"/"Focus Map" folders hold diagnostic sweeps, not photographs; only stack
+        // folders contribute a capture (their merged image).
+        for url in urls where CaptureLocation.isStackFolder(url) {
+            let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            guard isDirectory, let merged = CaptureLocation.mergedImage(inStackFolder: url) else { continue }
+            images.append(merged)
         }
         // Fetch each date once before sorting — stat-ing inside the comparator did O(n log n)
         // syscalls (10,000+ for a 1,000-file folder) on the main actor, a visible beachball on
@@ -322,6 +381,30 @@ final class CameraViewModel: ObservableObject {
         setLiveView(!isLiveViewOn)
     }
 
+    /// Starts live view whether or not this object thinks it is already running.
+    ///
+    /// Needed after a bracket: the session stops the feed itself (and the loop can stop *itself*
+    /// after the camera refuses previews for a moment), so `isLiveViewOn` here can say "on" while
+    /// nothing is running — and the ordinary guarded path would then do nothing at all, leaving the
+    /// panel dark and focus drive dead for the next stack.
+    func restartLiveView() {
+        let previous = liveViewToggleTask
+        liveViewToggleTask = Task { [weak self] in
+            _ = await previous?.result
+            guard let self else { return }
+            await self.session.stopLiveView()
+            await self.session.startLiveView()
+            // The flag is raised **after** the restart, not before.
+            //
+            // Stopping makes the session publish "live view inactive", and the observer above sets
+            // `isLiveViewOn = false` in response — so a flag raised beforehand was immediately
+            // lowered again. The frame consumer then dropped every arriving frame
+            // (`guard self.isLiveViewOn else { continue }`), which is why the session could be
+            // streaming 2,500 frames while the panel sat on "Waiting for live view…".
+            self.isLiveViewOn = true
+        }
+    }
+
     private func setLiveView(_ on: Bool) {
         guard on != isLiveViewOn else { return }
         isLiveViewOn = on
@@ -338,6 +421,221 @@ final class CameraViewModel: ObservableObject {
     }
 
     private var liveViewToggleTask: Task<Void, Never>?
+
+    // MARK: - HDR
+
+    // MARK: - Long operations
+
+    /// What a long-running job is doing, for the progress bar.
+    ///
+    /// One type for all of them — an HDR bracket, a timelapse, a stack merge — because the
+    /// photographer's question is always the same: is it still going, how far through, and how much
+    /// longer. Before this they had a line of text that changed occasionally and no way to tell a
+    /// slow step from a hung one.
+    struct Operation: Equatable {
+        var label: String
+        /// 0…1 where it is known. `nil` for a stage whose length cannot be known in advance — an
+        /// auto-bracket does not know how many exposures it needs until it has measured them — and
+        /// the bar shows indeterminate rather than inventing a number.
+        var fraction: Double?
+        /// Rough seconds remaining, where there is enough history to say.
+        var remaining: TimeInterval?
+        var isCancellable: Bool = false
+    }
+
+    @Published private(set) var operation: Operation?
+
+    /// Latest frame from a running timelapse, for the preview.
+    ///
+    /// Timelapse frames deliberately never reach the gallery — a 300-frame sequence is one piece of
+    /// work, not 300 photographs — so the viewer has nothing to show without this. Watching the
+    /// frames land is how a photographer notices the light has changed, or that something walked
+    /// into the shot, while there is still time to do something about it.
+    @Published private(set) var timelapsePreview: URL?
+
+    func setOperation(_ label: String, fraction: Double? = nil,
+                      remaining: TimeInterval? = nil, cancellable: Bool = false) {
+        operation = Operation(label: label, fraction: fraction,
+                              remaining: remaining, isCancellable: cancellable)
+    }
+
+    /// Stops whatever long job is running.
+    func cancelOperation() {
+        currentJob?.cancel()
+        statusText = "Stopping…"
+    }
+
+    /// The running long job, so it can be stopped.
+    private var currentJob: Task<Void, Never>?
+
+    func clearOperation() {
+        operation = nil
+        timelapsePreview = nil
+    }
+
+    // MARK: - Timelapse
+
+    @Published var timelapseInterval: Double = 10
+    @Published var timelapseFrames: Int = 300
+    @Published var timelapseHighestISO: Double = 6400
+    @Published private(set) var timelapseProgress: String?
+
+    /// Shoots a timelapse, then develops every frame with the correction that removes the exposure
+    /// steps.
+    func captureTimelapse() {
+        guard isConnected, !isBusy else { return }
+        let interval = timelapseInterval
+        let count = timelapseFrames
+        let ceiling = timelapseHighestISO
+        isBusy = true
+        statusText = "Timelapse — \(count) frames every \(Int(interval))s"
+        currentJob = Task {
+            defer { Task { @MainActor in
+                self.isBusy = false
+                self.timelapseProgress = nil
+                self.clearOperation()
+            } }
+            do {
+                let started = Date()
+                let result = try await session.captureTimelapse(
+                    intervalSeconds: interval, frameCount: count, highestISO: ceiling,
+                    status: { message in
+                        Task { @MainActor [weak self] in
+                            self?.statusText = message
+                            self?.timelapseProgress = message
+                        }
+                    },
+                    onFrame: { index, url in
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            self.timelapsePreview = url
+                            let done = Double(index + 1)
+                            // Remaining from the rate actually achieved, not from the nominal
+                            // interval: metering and downloading take time, and a sequence that is
+                            // running slower than planned should say so rather than keep promising
+                            // the planned finish.
+                            let elapsed = Date().timeIntervalSince(started)
+                            let perFrame = done > 0 ? elapsed / done : interval
+                            self.setOperation("Timelapse \(Int(done)) of \(count)",
+                                              fraction: done / Double(count),
+                                              remaining: perFrame * (Double(count) - done),
+                                              cancellable: true)
+                        }
+                    })
+                guard result.frames.count > 1 else {
+                    await MainActor.run { self.statusText = "Timelapse ended with too few frames to develop" }
+                    return
+                }
+                await MainActor.run { self.statusText = "Developing \(result.frames.count) frames…" }
+
+                // Deflicker across the whole sequence, then write the corrected TIFFs.
+                let gains = ExposureRamp.deflicker(exposures: result.frames.map(\.exposure),
+                                                   brightness: result.frames.map(\.brightness))
+                let developed = result.folder.appendingPathComponent("Developed")
+                try? FileManager.default.createDirectory(at: developed, withIntermediateDirectories: true)
+                let frames = result.frames
+                let biggest = gains.map(abs).max() ?? 0
+                let developStarted = Date()
+                try await Task.detached(priority: .utility) {
+                    for (index, frame) in frames.enumerated() {
+                        let name = frame.url.deletingPathExtension().lastPathComponent + ".tif"
+                        try HDRRenderer.developRamped(frame.url, gainStops: gains[index],
+                                                      to: developed.appendingPathComponent(name))
+                        await MainActor.run { [weak self] in
+                            guard let self else { return }
+                            let done = Double(index + 1)
+                            let perFrame = Date().timeIntervalSince(developStarted) / done
+                            self.setOperation("Developing \(index + 1) of \(frames.count)",
+                                              fraction: done / Double(frames.count),
+                                              remaining: perFrame * (Double(frames.count) - done))
+                        }
+                    }
+                }.value
+
+                await MainActor.run {
+                    self.statusText = String(format: "Timelapse done — %d frames, largest correction %.2f stops",
+                                             frames.count, biggest)
+                    NSWorkspace.shared.activateFileViewerSelecting([developed])
+                }
+            } catch is CancellationError {
+                await MainActor.run { self.statusText = "Timelapse cancelled" }
+            } catch {
+                await MainActor.run { self.statusText = error.localizedDescription }
+            }
+        }
+    }
+
+    /// Shoots an HDR bracket, letting the scene decide the count and spacing.
+    ///
+    /// There is no fixed-spread alternative. A chosen spread is a guess about a scene nobody has
+    /// looked at — it wastes frames on an evenly-lit subject and falls short of a window in a dark
+    /// room — and the measurement does the job without asking.
+    func captureHDR() {
+        guard isConnected, !isBusy else { return }
+        isBusy = true
+        statusText = "HDR — measuring the scene…"
+        // Indeterminate while bracketing: an automatic bracket does not know how many exposures it
+        // needs until it has measured them, and a made-up denominator would be worse than none.
+        setOperation("HDR — measuring the scene", cancellable: true)
+        currentJob = Task {
+            defer { Task { @MainActor in self.isBusy = false; self.clearOperation() } }
+            do {
+                let report: @Sendable (String) -> Void = { message in
+                    Task { @MainActor [weak self] in
+                        self?.statusText = message
+                        self?.setOperation(message, cancellable: true)
+                    }
+                }
+                let result = try await session.captureAutoHDRBracket(status: report)
+                await MainActor.run { self.statusText = "Merging \(result.frames.count) exposures…" }
+
+                let output = result.folder.appendingPathComponent(
+                    CaptureLocation.mergedFileName(inStackFolder: result.folder))
+                let frames = result.frames
+                let reference = result.referenceIndex
+                let blendStarted = Date()
+                let render = try await Task.detached(priority: .utility) {
+                    try HDRRenderer.render(urls: frames, referenceIndex: reference,
+                                           outputURL: output) { fraction, label in
+                        Task { @MainActor [weak self] in
+                            let elapsed = Date().timeIntervalSince(blendStarted)
+                            self?.setOperation(label, fraction: fraction,
+                                               remaining: fraction > 0.02
+                                                   ? elapsed / fraction - elapsed : nil)
+                        }
+                    }
+                }.value
+
+                await MainActor.run {
+                    self.registerMergedHDR(render.outputURL, recoveredStops: render.recoveredStops)
+                }
+            } catch is CancellationError {
+                await MainActor.run { self.statusText = "HDR cancelled" }
+            } catch {
+                await MainActor.run { self.statusText = error.localizedDescription }
+            }
+        }
+    }
+
+    /// Publishes the merged HDR, and says what the bracket actually bought.
+    ///
+    /// Reporting the recovered stops matters: a bracket of a scene that fitted in one frame recovers
+    /// nothing, and the photographer should learn that from the app rather than by comparing files.
+    private func registerMergedHDR(_ url: URL, recoveredStops: Double) {
+        let folder = url.deletingLastPathComponent()
+        guard folder.deletingLastPathComponent() == CaptureLocation.directory else { return }
+        if let existing = captures.firstIndex(of: url) {
+            captures.remove(at: existing)
+            captures.append(url)
+        } else {
+            captures.append(url)
+            captureCount += 1
+        }
+        lastCaptureURL = url
+        statusText = recoveredStops >= 0.25
+            ? String(format: "HDR merged — %.1f stops of highlight recovered", recoveredStops)
+            : "HDR merged — the scene already fitted in one exposure"
+    }
 
     func capture() {
         // Ignore shutter presses while the link is down — Space has no disabled state to
