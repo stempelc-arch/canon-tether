@@ -259,7 +259,11 @@ public struct ContentView: View {
     // MARK: - Capture column (preview + control bar)
 
     private var captureColumn: some View {
-        let url = reviewModel.mainViewerURL(in: viewModel.captures)
+        // A running timelapse owns the viewer. Its frames never reach the gallery — a 300-frame
+        // sequence is one piece of work, not 300 photographs — so without this the photographer
+        // watches a stale picture for an hour with no idea whether the light has changed or someone
+        // has walked into the shot.
+        let url = viewModel.timelapsePreview ?? reviewModel.mainViewerURL(in: viewModel.captures)
         return VStack(spacing: 0) {
             if !viewModel.isConnected {
                 ReconnectBanner(status: viewModel.statusText)
@@ -269,6 +273,10 @@ public struct ContentView: View {
                           feed: viewModel.liveViewFeed,
                           isLiveViewOn: viewModel.isLiveViewOn)
                 .overlay(alignment: .top) { mainViewerControl }
+
+            if let operation = viewModel.operation {
+                OperationBar(operation: operation) { viewModel.cancelOperation() }
+            }
 
             Divider()
 
@@ -1144,6 +1152,53 @@ private struct OnboardingView: View {
 }
 
 // MARK: - Preferences
+
+/// Progress for a long job: what it is doing, how far through, and roughly how much longer.
+///
+/// The "how much longer" matters more than it looks. A focus-stack merge or a 300-frame timelapse is
+/// minutes of apparently nothing happening, and without a number the photographer cannot tell a slow
+/// step from a hung one — which is a question that came up repeatedly while building these features,
+/// usually answered by reading a log.
+private struct OperationBar: View {
+    let operation: CameraViewModel.Operation
+    let cancel: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            // Determinate where the length is known, indeterminate where it genuinely is not —
+            // an automatic bracket cannot know how many exposures it needs until it has measured.
+            if let fraction = operation.fraction {
+                ProgressView(value: min(max(fraction, 0), 1))
+                    .frame(width: 160)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+            Text(operation.label)
+                .font(.callout)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if let remaining = operation.remaining, remaining > 2 {
+                Text(Self.readable(remaining))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if operation.isCancellable {
+                Button("Stop", action: cancel)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(.quaternary.opacity(0.4))
+    }
+
+    /// Rounded, never false-precise: "about 4 min" is honest where "4:07 remaining" is not, given
+    /// the estimate comes from an average that is still moving.
+    static func readable(_ seconds: TimeInterval) -> String {
+        if seconds < 90 { return "about \(Int((seconds / 5).rounded()) * 5)s left" }
+        return "about \(Int((seconds / 60).rounded())) min left"
+    }
+}
 
 private struct TimelapseSheet: View {
     @ObservedObject var viewModel: CameraViewModel

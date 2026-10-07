@@ -424,6 +424,55 @@ final class CameraViewModel: ObservableObject {
 
     // MARK: - HDR
 
+    // MARK: - Long operations
+
+    /// What a long-running job is doing, for the progress bar.
+    ///
+    /// One type for all of them — an HDR bracket, a timelapse, a stack merge — because the
+    /// photographer's question is always the same: is it still going, how far through, and how much
+    /// longer. Before this they had a line of text that changed occasionally and no way to tell a
+    /// slow step from a hung one.
+    struct Operation: Equatable {
+        var label: String
+        /// 0…1 where it is known. `nil` for a stage whose length cannot be known in advance — an
+        /// auto-bracket does not know how many exposures it needs until it has measured them — and
+        /// the bar shows indeterminate rather than inventing a number.
+        var fraction: Double?
+        /// Rough seconds remaining, where there is enough history to say.
+        var remaining: TimeInterval?
+        var isCancellable: Bool = false
+    }
+
+    @Published private(set) var operation: Operation?
+
+    /// Latest frame from a running timelapse, for the preview.
+    ///
+    /// Timelapse frames deliberately never reach the gallery — a 300-frame sequence is one piece of
+    /// work, not 300 photographs — so the viewer has nothing to show without this. Watching the
+    /// frames land is how a photographer notices the light has changed, or that something walked
+    /// into the shot, while there is still time to do something about it.
+    @Published private(set) var timelapsePreview: URL?
+
+    func setOperation(_ label: String, fraction: Double? = nil,
+                      remaining: TimeInterval? = nil, cancellable: Bool = false) {
+        operation = Operation(label: label, fraction: fraction,
+                              remaining: remaining, isCancellable: cancellable)
+    }
+
+    /// Stops whatever long job is running.
+    func cancelOperation() {
+        currentJob?.cancel()
+        statusText = "Stopping…"
+    }
+
+    /// The running long job, so it can be stopped.
+    private var currentJob: Task<Void, Never>?
+
+    func clearOperation() {
+        operation = nil
+        timelapsePreview = nil
+    }
+
     // MARK: - Timelapse
 
     @Published var timelapseInterval: Double = 10
@@ -440,16 +489,39 @@ final class CameraViewModel: ObservableObject {
         let ceiling = timelapseHighestISO
         isBusy = true
         statusText = "Timelapse — \(count) frames every \(Int(interval))s"
-        Task {
-            defer { Task { @MainActor in self.isBusy = false; self.timelapseProgress = nil } }
+        currentJob = Task {
+            defer { Task { @MainActor in
+                self.isBusy = false
+                self.timelapseProgress = nil
+                self.clearOperation()
+            } }
             do {
+                let started = Date()
                 let result = try await session.captureTimelapse(
-                    intervalSeconds: interval, frameCount: count, highestISO: ceiling) { message in
+                    intervalSeconds: interval, frameCount: count, highestISO: ceiling,
+                    status: { message in
                         Task { @MainActor [weak self] in
                             self?.statusText = message
                             self?.timelapseProgress = message
                         }
-                    }
+                    },
+                    onFrame: { index, url in
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            self.timelapsePreview = url
+                            let done = Double(index + 1)
+                            // Remaining from the rate actually achieved, not from the nominal
+                            // interval: metering and downloading take time, and a sequence that is
+                            // running slower than planned should say so rather than keep promising
+                            // the planned finish.
+                            let elapsed = Date().timeIntervalSince(started)
+                            let perFrame = done > 0 ? elapsed / done : interval
+                            self.setOperation("Timelapse \(Int(done)) of \(count)",
+                                              fraction: done / Double(count),
+                                              remaining: perFrame * (Double(count) - done),
+                                              cancellable: true)
+                        }
+                    })
                 guard result.frames.count > 1 else {
                     await MainActor.run { self.statusText = "Timelapse ended with too few frames to develop" }
                     return
@@ -463,15 +535,19 @@ final class CameraViewModel: ObservableObject {
                 try? FileManager.default.createDirectory(at: developed, withIntermediateDirectories: true)
                 let frames = result.frames
                 let biggest = gains.map(abs).max() ?? 0
+                let developStarted = Date()
                 try await Task.detached(priority: .utility) {
                     for (index, frame) in frames.enumerated() {
                         let name = frame.url.deletingPathExtension().lastPathComponent + ".tif"
                         try HDRRenderer.developRamped(frame.url, gainStops: gains[index],
                                                       to: developed.appendingPathComponent(name))
-                        if index % 10 == 0 {
-                            await MainActor.run { [weak self] in
-                                self?.statusText = "Developing \(index + 1) of \(frames.count)…"
-                            }
+                        await MainActor.run { [weak self] in
+                            guard let self else { return }
+                            let done = Double(index + 1)
+                            let perFrame = Date().timeIntervalSince(developStarted) / done
+                            self.setOperation("Developing \(index + 1) of \(frames.count)",
+                                              fraction: done / Double(frames.count),
+                                              remaining: perFrame * (Double(frames.count) - done))
                         }
                     }
                 }.value
@@ -498,11 +574,17 @@ final class CameraViewModel: ObservableObject {
         guard isConnected, !isBusy else { return }
         isBusy = true
         statusText = "HDR — measuring the scene…"
-        Task {
-            defer { Task { @MainActor in self.isBusy = false } }
+        // Indeterminate while bracketing: an automatic bracket does not know how many exposures it
+        // needs until it has measured them, and a made-up denominator would be worse than none.
+        setOperation("HDR — measuring the scene", cancellable: true)
+        currentJob = Task {
+            defer { Task { @MainActor in self.isBusy = false; self.clearOperation() } }
             do {
                 let report: @Sendable (String) -> Void = { message in
-                    Task { @MainActor [weak self] in self?.statusText = message }
+                    Task { @MainActor [weak self] in
+                        self?.statusText = message
+                        self?.setOperation(message, cancellable: true)
+                    }
                 }
                 let result = try await session.captureAutoHDRBracket(status: report)
                 await MainActor.run { self.statusText = "Merging \(result.frames.count) exposures…" }
@@ -511,8 +593,17 @@ final class CameraViewModel: ObservableObject {
                     CaptureLocation.mergedFileName(inStackFolder: result.folder))
                 let frames = result.frames
                 let reference = result.referenceIndex
+                let blendStarted = Date()
                 let render = try await Task.detached(priority: .utility) {
-                    try HDRRenderer.render(urls: frames, referenceIndex: reference, outputURL: output)
+                    try HDRRenderer.render(urls: frames, referenceIndex: reference,
+                                           outputURL: output) { fraction, label in
+                        Task { @MainActor [weak self] in
+                            let elapsed = Date().timeIntervalSince(blendStarted)
+                            self?.setOperation(label, fraction: fraction,
+                                               remaining: fraction > 0.02
+                                                   ? elapsed / fraction - elapsed : nil)
+                        }
+                    }
                 }.value
 
                 await MainActor.run {

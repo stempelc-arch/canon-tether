@@ -2193,13 +2193,15 @@ actor GPhotoSession {
     func captureTimelapse(intervalSeconds: Double,
                           frameCount: Int,
                           highestISO: Double,
-                          status: @escaping @Sendable (String) -> Void) async throws -> TimelapseResult {
+                          status: @escaping @Sendable (String) -> Void,
+                          onFrame: @escaping @Sendable (Int, URL) -> Void = { _, _ in }) async throws -> TimelapseResult {
         try await withTetherPaused {
             try await withRAWCapture {
                 try await captureTimelapseInner(intervalSeconds: intervalSeconds,
                                                 frameCount: frameCount,
                                                 highestISO: highestISO,
-                                                status: status)
+                                                status: status,
+                                                onFrame: onFrame)
             }
         }
     }
@@ -2207,7 +2209,8 @@ actor GPhotoSession {
     private func captureTimelapseInner(intervalSeconds: Double,
                                        frameCount: Int,
                                        highestISO: Double,
-                                       status: @escaping @Sendable (String) -> Void) async throws -> TimelapseResult {
+                                       status: @escaping @Sendable (String) -> Void,
+                                       onFrame: @escaping @Sendable (Int, URL) -> Void) async throws -> TimelapseResult {
         let shutterOutput = try await getConfig(ExposureGrid.shutterPath)
         let isoOutput = try await getConfig(ExposureGrid.isoPath)
         guard let shutterSetting = CameraSetting.parse(from: shutterOutput, path: ExposureGrid.shutterPath),
@@ -2259,6 +2262,9 @@ actor GPhotoSession {
                     (brightness: HDRRenderer.rampBrightness(of: url),
                      exposure: HDRRenderer.relativeExposure(of: url))
                 }.value
+                // Hand the frame over as soon as it lands, so the preview keeps up with the
+                // shoot rather than appearing when it finishes.
+                onFrame(index, url)
                 guard let brightness = measured.brightness, brightness > 0 else { continue }
                 frames.append(TimelapseFrame(url: url,
                                              exposure: measured.exposure ?? 1,
