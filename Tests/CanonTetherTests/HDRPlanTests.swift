@@ -10,12 +10,6 @@ final class HDRPlanTests: XCTestCase {
                            "1/200","1/250","1/320","1/400","1/500","1/640","1/800","1/1000","1/1250",
                            "1/1600","1/2000","1/2500","1/3200","1/4000","1/5000","1/6400","1/8000"]
 
-    func testBracketShapeIsThreeFramesDarkestFirst() {
-        XCTAssertEqual(HDRPlan(spread: .twoStops).offsets, [-2, 0, 2])
-        XCTAssertEqual(HDRPlan(spread: .fourStops).offsets, [-4, 0, 4])
-        XCTAssertEqual(HDRPlan().referenceIndex, 1, "the metered frame anchors the merge")
-    }
-
     /// `ExposureGrid.stops` measures shutter as `-log2(seconds)`, so its scale rises as the frame
     /// gets *darker*. Getting that sign backwards shoots the bracket inside out — the merge still
     /// runs and the result quietly loses the range it was supposed to gain.
@@ -27,18 +21,11 @@ final class HDRPlanTests: XCTestCase {
         XCTAssertEqual(HDRPlan.shutter(stopsFrom: "1/125", stops: 0, in: choices), "1/125")
     }
 
-    func testWholeBracketResolves() {
-        XCTAssertEqual(HDRPlan(spread: .twoStops).shutterSpeeds(metered: "1/125", choices: choices),
-                       ["1/500", "1/125", "1/30"])
-        XCTAssertEqual(HDRPlan(spread: .fourStops).shutterSpeeds(metered: "1/125", choices: choices),
-                       ["1/2000", "1/125", "1/8"])
-    }
 
     /// Running out of shutter range is refused, never silently shot at whatever is nearest: a
     /// bracket at the wrong offsets produces a merge that looks fine and holds less range.
     func testOutOfRangeIsRefused() {
         XCTAssertNil(HDRPlan.shutter(stopsFrom: "1/8000", stops: -2, in: choices))
-        XCTAssertNil(HDRPlan(spread: .fourStops).shutterSpeeds(metered: "1/4000", choices: choices))
     }
 
     /// Bodies set to half-stop increments offer a different list; the nearest value within a third
@@ -48,9 +35,4 @@ final class HDRPlanTests: XCTestCase {
         XCTAssertEqual(HDRPlan.shutter(stopsFrom: "1/125", stops: -2, in: halves), "1/500")
     }
 
-    func testSummaryReadsPlainly() {
-        XCTAssertEqual(HDRPlan(spread: .twoStops).summary(metered: "1/125"),
-                       "3 frames, ±2 stops around 1/125")
-        XCTAssertEqual(HDRPlan.Spread.allCases.map(\.label), ["±2 stops", "±4 stops"])
-    }
 }

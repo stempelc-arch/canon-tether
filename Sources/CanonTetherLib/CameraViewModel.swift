@@ -424,20 +424,6 @@ final class CameraViewModel: ObservableObject {
 
     // MARK: - HDR
 
-    /// Spread for the next HDR bracket, remembered between shots. Plain `UserDefaults` rather than
-    /// `@AppStorage`, which is a SwiftUI property wrapper and not available on a view model.
-    static let hdrSpreadKey = "hdrSpread"
-    @Published var hdrSpread: HDRPlan.Spread = HDRPlan.Spread(
-        rawValue: UserDefaults.standard.object(forKey: CameraViewModel.hdrSpreadKey) as? Int ?? 2) ?? .twoStops {
-        didSet { UserDefaults.standard.set(hdrSpread.rawValue, forKey: Self.hdrSpreadKey) }
-    }
-
-    /// Shoots an exposure bracket and merges it, publishing only the merged result.
-    ///
-    /// The merge runs off the main actor at `.utility`: it is several seconds of CPU on full-
-    /// resolution RAW, and the same lesson as the focus-stack merge applies — saturating the
-    /// machine at a higher priority starves the live-view decode and freezes the UI, which is
-    /// indistinguishable from a hang.
     // MARK: - Timelapse
 
     @Published var timelapseInterval: Double = 10
@@ -503,21 +489,22 @@ final class CameraViewModel: ObservableObject {
         }
     }
 
-    /// Shoots an HDR bracket. `automatic` lets the scene decide the count and spacing.
-    func captureHDR(automatic: Bool = true) {
+    /// Shoots an HDR bracket, letting the scene decide the count and spacing.
+    ///
+    /// There is no fixed-spread alternative. A chosen spread is a guess about a scene nobody has
+    /// looked at — it wastes frames on an evenly-lit subject and falls short of a window in a dark
+    /// room — and the measurement does the job without asking.
+    func captureHDR() {
         guard isConnected, !isBusy else { return }
-        let plan = HDRPlan(spread: hdrSpread)
         isBusy = true
-        statusText = automatic ? "HDR — measuring the scene…" : "HDR — \(plan.summary(metered: nil))"
+        statusText = "HDR — measuring the scene…"
         Task {
             defer { Task { @MainActor in self.isBusy = false } }
             do {
                 let report: @Sendable (String) -> Void = { message in
                     Task { @MainActor [weak self] in self?.statusText = message }
                 }
-                let result = automatic
-                    ? try await session.captureAutoHDRBracket(status: report)
-                    : try await session.captureHDRBracket(plan: plan, status: report)
+                let result = try await session.captureAutoHDRBracket(status: report)
                 await MainActor.run { self.statusText = "Merging \(result.frames.count) exposures…" }
 
                 let output = result.folder.appendingPathComponent(

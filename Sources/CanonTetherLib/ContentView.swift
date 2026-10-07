@@ -131,26 +131,14 @@ public struct ContentView: View {
 
             // A menu rather than a plain button: the spread is the one thing that changes between
             // scenes, and burying it in Preferences would mean leaving the shot to go and set it.
-            Menu {
-                Button("Shoot HDR — automatic") { viewModel.captureHDR(automatic: true) }
-                Divider()
-                Section("Fixed spread") {
-                    ForEach(HDRPlan.Spread.allCases) { spread in
-                        Button("Shoot HDR \(spread.label)") {
-                            viewModel.hdrSpread = spread
-                            viewModel.captureHDR(automatic: false)
-                        }
-                    }
-                }
+            Button {
+                viewModel.captureHDR()
             } label: {
                 Label("HDR", systemImage: "camera.filters")
-            } primaryAction: {
-                // Automatic is the primary action: the scene knows how many exposures it needs
-                // better than a setting chosen before looking at it.
-                viewModel.captureHDR(automatic: true)
             }
-            .help("Shoot an exposure bracket in RAW and merge it. Automatic keeps shooting until "
-                  + "nothing is clipped or buried in noise; the menu has fixed spreads.")
+            .help("Shoot an exposure bracket in RAW and blend it. Keeps shooting until nothing is "
+                  + "clipped or buried in noise, then takes each part of the picture from whichever "
+                  + "exposure rendered it well.")
             .disabled(!viewModel.isConnected || viewModel.isBusy)
 
             Button {
