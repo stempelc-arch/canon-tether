@@ -222,6 +222,19 @@ public enum StackPyramid {
     /// A Laplacian pyramid: `levels - 1` band-pass levels, finest first, with the residual
     /// low-pass ("base") as the final entry. Collapsing this exactly reconstructs the input, which
     /// is what `StackPyramidTests` pins — an inexact pyramid silently costs contrast in the merge.
+    /// Successively halved copies of an image — the scales a Laplacian pyramid is the differences
+    /// between. Exposure fusion needs these for its weight maps, which have no detail to subtract.
+    public static func gaussianPyramid(_ image: StackImage, levels: Int) -> [StackImage] {
+        var result = [image]
+        var current = image
+        for _ in 0..<levels {
+            guard current.width >= 2, current.height >= 2 else { break }
+            current = reduce(current)
+            result.append(current)
+        }
+        return result
+    }
+
     public static func laplacianPyramid(_ image: StackImage, levels: Int) -> [StackImage] {
         var pyramid: [StackImage] = []
         var current = image

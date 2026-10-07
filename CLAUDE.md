@@ -1838,6 +1838,55 @@ look this feature exists to avoid.
 Worth saying out loud when a result disappoints: check whether the scene is asking for more range
 than the output medium has, before changing any code.
 
+## HDR renders by fusion, not tone mapping (2026-10-07)
+
+The merged output went through several rounds of being wrong in different ways — dim, then flat,
+then garish, then fluorescent — and each fix was a constant chosen by code that cannot see the room.
+Brightness (`targetKey`), contrast strength, saturation exponent: three aesthetic judgements, all
+interacting, none of them measurable. The honest read is that the whole approach was wrong.
+
+**Merging to radiance and then rendering it means inventing a rendering.** The bracket already
+contains the answer: for every part of the scene some frame exposed it correctly, and the camera
+already knows how to render a correctly-exposed frame — that is what its own processing does.
+
+`ExposureFusion` therefore decodes each frame with `CIRAWFilter` **left alone** (no `boostAmount = 0`,
+no linear working space) and blends the *rendered* frames, weighting each pixel by how well exposed
+it is. The output is the camera's own rendering everywhere, chosen per region. There is no key, no
+tone curve, no saturation control, and nothing to dial.
+
+- **Blending is on Laplacian pyramids.** A hard cut between exposures wherever the weights change
+  quickly *is* a halo; combining band by band spreads each transition over that band's own scale.
+  `StackPyramid.gaussianPyramid` was added for the weight maps, which have no detail to subtract.
+- **Weights come from luminance, not per channel.** Weighting channels separately pulls a saturated
+  red toward whichever frame placed *red* near mid-grey, which shifts hue.
+- Weights are normalised per pixel, so a region no frame exposed well does not come out darker than
+  its neighbours for no visible reason.
+
+`HDRMerge` and `HDRToneCurve` are deleted. They were a correct radiance merge and a learned tone
+curve, and neither is part of the product any more; leaving them would be dead code that reads as
+live.
+
+### What the discarded approach taught
+
+Kept because the facts are durable even though the code is gone:
+
+- **Preserving colour ratios exactly is what over-saturates.** Scale a dark saturated orange up three
+  stops and its red pins at 1 while its blue is still low. A camera's per-channel curve hides this by
+  compressing each channel separately, which desaturates bright colours as a side effect — lose that
+  and it must be put back deliberately.
+- **A tone curve applied per channel is a saturation and hue shift**, not a brightness change.
+- **The exposure lift dominates everything downstream.** A dim room brightened three stops is a
+  bright room whatever the curve does.
+- Some scenes genuinely cannot hold both ends: that room's midtone sat ~9 stops below its window and
+  a display holds ~2.5 stops above middle grey.
+
+### And a process failure worth not repeating
+
+Sliders were added for these three constants, and that was wrong — the photographer had said from the
+start that the app should work things out rather than expose knobs, and had already had the manual
+controls stripped out of the focus panel for the same reason. **Reaching for a setting is what to do
+when the problem is genuinely a matter of taste, not when the problem is that the approach is wrong.**
+
 ## Next steps
 - Confirm how the "other Mac" (where this was reopened) currently connects to the camera — USB or Ethernet — since that determines whether to resume the Ethernet investigation or go straight to USB + libgphoto2.
 - If USB: install `libgphoto2`/`gphoto2` via Homebrew, confirm `gphoto2 --auto-detect` sees the camera, then start building the app (SwiftUI native app was the agreed shape; scope included tethered capture, live view, camera settings control, and post-capture preview — build capture first, layer in the rest).

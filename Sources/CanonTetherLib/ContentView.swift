@@ -1242,7 +1242,6 @@ private struct PreferencesView: View {
     @AppStorage("exposureCheckEnabled") private var exposureEnabled = true
     @AppStorage("checkForUpdates") private var updatesEnabled = true
     @State private var backups: [CaptureBackup.Destination] = BackupSettings.load()
-    @State private var hdrLook: HDRLook = HDRSettings.load()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -1271,41 +1270,6 @@ private struct PreferencesView: View {
             // Grouped so the VStack stays within SwiftUI's ten-child builder limit.
             Group {
                 Divider()
-
-                // HDR look
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("HDR Look").font(.headline)
-                    HStack {
-                        Text("Brighten up to").frame(width: 104, alignment: .leading)
-                        Slider(value: $hdrLook.exposureLimit, in: 0...4, step: 0.5)
-                        Text(String(format: "%.1f stops", hdrLook.exposureLimit))
-                            .font(.callout.monospacedDigit()).frame(width: 74, alignment: .trailing)
-                    }
-                    HStack {
-                        Text("Contrast").frame(width: 104, alignment: .leading)
-                        Slider(value: $hdrLook.contrast, in: 0...0.8, step: 0.05)
-                        Text(String(format: "%.2f", hdrLook.contrast))
-                            .font(.callout.monospacedDigit()).frame(width: 74, alignment: .trailing)
-                    }
-                    HStack {
-                        Text("Saturation").frame(width: 104, alignment: .leading)
-                        Slider(value: $hdrLook.saturation, in: 0.3...1.0, step: 0.05)
-                        Text(String(format: "%.2f", hdrLook.saturation))
-                            .font(.callout.monospacedDigit()).frame(width: 74, alignment: .trailing)
-                    }
-                    Text("How a merged HDR is rendered. Brightness is the one that matters most — a "
-                         + "dim room lifted three stops is a bright room whatever the other two do. "
-                         + "These are taste, not correctness; the merge itself is unaffected, so a "
-                         + "re-merge of the same frames will pick up a change.")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    HStack {
-                        Button("Reset") { hdrLook = .default; HDRSettings.save(hdrLook) }
-                        Spacer()
-                    }
-                }
-                .onChange(of: hdrLook) { HDRSettings.save($0) }
 
                 Divider()
 
